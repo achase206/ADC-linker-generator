@@ -468,15 +468,24 @@ if __name__ == "__main__":
     # train the model on the entire dataset and save the result
     model_scores = train_LSTM_scores(adc_directory)
     test_LSTM_scores(adc_directory, model_scores)
-    torch.save(model_scores, "models/LSTM_scores.pth")
+    torch.save(model_scores.state_dict(), "models/model_scores_weights.pth")
 
     # train the sequence to sequence generative model
     model_gen = train_LSTM_gen(adc_directory)
-    torch.save(model_gen, "models/LSTM_gen.pth")
+    torch.save(model_gen.state_dict(), "models/model_gen_weights.pth")
 
     # generate a new sequence from our trained generator model
-    model_gen = torch.load("models/LSTM_gen.pth", weights_only=False)
     token = Tokenizer(adc_directory)
+    model_gen = LSTMGenModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        output_dim=len(token.smiles_map),
+        directory=adc_directory,
+    )
+    model_gen.load_state_dict(
+        torch.load("models/model_gen_weights.pth", weights_only=True)
+    )
     sequence = generate_smiles(model_gen, adc_directory)
     print(token.tokens_to_smiles(sequence))
     print(len(sequence))
