@@ -384,7 +384,9 @@ def train_LSTM_gen(directory):
 
             optimizer.zero_grad()
 
-            output, _, _ = model(inputs)  # don't need hidden or cell state for training
+            # teacher forcing approach, only using ground truth for loss
+            # instead of feeding models previous output we use the actual known previous token
+            output, _, _ = model(inputs)
             loss = criterion(
                 output.view(-1, len(token.smiles_map)), target.view(-1)
             )  # -1 flattens our sequence
@@ -417,6 +419,9 @@ def generate_smiles(model, directory):
     with torch.no_grad():
         for i in range(max_smiles_length):
 
+            # now because we don't know that the previous state was correct
+            # we rely on the models actual prediction instead of relying on ground truth
+            # we now feed the previous hidden and cell state into our model
             output, hidden_state, cell_state = model(
                 current_token, hidden_state, cell_state
             )
@@ -453,14 +458,23 @@ def generate_smiles(model, directory):
 
 
 if __name__ == "__main__":
+    # Load our ADC dataset
     adc_directory = "data/adc_data_complete_v2.pkl"
-    # df = pd.read_pickle(adc_directory)
-    # kfolds_LSTM_scores(adc_directory)
-    # model_scores = train_LSTM_scores(adc_directory)
-    # test_LSTM_scores(adc_directory, model_scores)
-    # torch.save(model_scores, "models/LSTM_scores.pth")
-    # model_gen = train_LSTM_gen(adc_directory)
-    # torch.save(model_gen, "models/LSTM_gen.pth")
+    df = pd.read_pickle(adc_directory)
+
+    # Perform k-folds on sequence to one model to assess hyperparameters
+    kfolds_LSTM_scores(adc_directory)
+
+    # train the model on the entire dataset and save the result
+    model_scores = train_LSTM_scores(adc_directory)
+    test_LSTM_scores(adc_directory, model_scores)
+    torch.save(model_scores, "models/LSTM_scores.pth")
+
+    # train the sequence to sequence generative model
+    model_gen = train_LSTM_gen(adc_directory)
+    torch.save(model_gen, "models/LSTM_gen.pth")
+
+    # generate a new sequence from our trained generator model
     model_gen = torch.load("models/LSTM_gen.pth", weights_only=False)
     token = Tokenizer(adc_directory)
     sequence = generate_smiles(model_gen, adc_directory)
