@@ -19,7 +19,7 @@ from torchrl.data import (
     UnboundedContinuousTensorSpec,
     DiscreteTensorSpec,
 )
-from tensordict.nn import TensorDictModule
+from tensordict.nn import TensorDictModule, TensorDictSequential
 
 # Other modules
 import numpy as np
@@ -174,13 +174,53 @@ class LSTMGenModel(nn.Module, Tokenizer):
         return out, hidden_state, cell_state
 
 
+class CriticModel(nn.Module, Tokenizer):
+    def __init__(self, input_dim, hidden_dim, layer_dim, output_dim, directory):
+        super().__init__()
+        Tokenizer.__init__(self, directory)
+        self.hidden_dim = hidden_dim
+        self.layer_dim = layer_dim
+        self.embedding = nn.Embedding(
+            num_embeddings=len(self.smiles_map),
+            embedding_dim=input_dim,
+            padding_idx=self.smiles_map["PAD"],
+        )
+        self.lstm = nn.LSTM(input_dim, hidden_dim, layer_dim, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x, hidden=None, cell=None):
+        embedded_seq = self.embedding(x)
+
+        # for RL we need the hidden and cell state
+        # didn't need it for initial training on entire sequence
+
+        if hidden is not None and cell is not None:
+
+            # Torch RL passes in batch, num_layers, hidden_dim
+            # we need to reshape if that is the case for our lstm forward call
+            # passed in as (16,5,256) change to (5,16,256)
+            if hidden.shape[0] != self.layer_dim:
+                hidden = hidden.permute(1, 0, 2).contiguous()
+                cell = cell.permute(1, 0, 2).contiguous()
+
+            out, _ = self.lstm(embedded_seq, (hidden, cell))
+
+        else:
+            out, _ = self.lstm(embedded_seq)
+
+        out = out[:, -1, :]  # Take last time step
+        out = self.fc(out)  # final layer
+
+        return out
+
+
 class adcDataset(Dataset, Tokenizer):
 
     SMI_REGEX = re.compile(
         r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|B|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\|\/|:|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
     )
 
-    def __init__(self, directory):
+    def __init__(self, directory, score_type):
         Tokenizer.__init__(self, directory)
         self.directory = directory
         self.file = pd.read_pickle(directory)
@@ -189,14 +229,31 @@ class adcDataset(Dataset, Tokenizer):
             .str.findall(adcDataset.SMI_REGEX)
             .apply(self.smiles_to_tokens)
         )
-        self.SA_score = torch.tensor(np.array((self.file["calc_SA_score"])))
+
+        if score_type == "SA":
+            self.score = torch.tensor(np.array((self.file["calc_SA_score"])))
+
+        elif score_type == "TPSA":
+            self.score = torch.tensor(np.array((self.file["TPSA"])))
+
+        elif score_type == "QED":
+            self.score = torch.tensor(np.array((self.file["QED"])))
+
+        elif score_type == "LogP":
+            self.score = torch.tensor(np.array((self.file["LogP"])))
+
+        elif score_type == "CSP3":
+            self.score = torch.tensor(np.array((self.file["FractionCSP3"])))
+
+        else:
+            raise ValueError("Not a valid scoring metric")
 
     def __len__(self):
         return len(self.smiles)
 
     def __getitem__(self, idx):
         smile = torch.tensor(self.smiles[idx])
-        score = torch.tensor([self.SA_score[idx]])
+        score = torch.tensor([self.score[idx]])
 
         return smile, score
 
@@ -213,7 +270,7 @@ class SmilesGeneratorEnv(EnvBase):
 
     def __init__(
         self,
-        score_model,
+        reward_model,
         vocab_size,
         max_length,
         num_layers,
@@ -225,9 +282,8 @@ class SmilesGeneratorEnv(EnvBase):
         super().__init__(
             device=device, batch_size=[]
         )  # batch of [] means one env for serial processing
-        self.observation_spec = CompositeSpec()
 
-        self.scorer = score_model
+        self.rewarder = reward_model
         self.vocab_size = vocab_size
         self.max_length = max_length
         self.num_layers = num_layers
@@ -320,19 +376,25 @@ class SmilesGeneratorEnv(EnvBase):
 
             if mol is None:
                 # an invalid smiles string was generated
-                reward = -20.0
+                reward = -0.5
 
             else:
                 # matches model device if on cuda
-                device = next(self.scorer.parameters()).device
+                device = self.device
 
                 # convert the sequence to a tensor to pass into scoring model
                 full_sequence = torch.tensor(
                     self.generated_sequence, device=device
                 ).unsqueeze(0)
 
+                score_input = TensorDict(
+                    {"observation": full_sequence}, batch_size=[1], device=device
+                )
+
                 with torch.no_grad():
-                    reward = -1 * self.scorer(full_sequence).item()
+                    self.rewarder(score_input)
+
+                reward = score_input["reward"].item()
 
         # pass along info for next iterations, observation is just our action for the step
         # reward is 0 if not done and done and terminated are false if we haven't reached "END" or max length
@@ -455,9 +517,18 @@ def kfolds_LSTM_scores(directory):
     print(f"RMSE Validation Loss: {rmse:.4f}")
 
 
-def train_LSTM_scores(directory):
+def train_LSTM_scores(directory, score_type):
+    """
+    Training loop for LSTM scoring metrics
+    Used later on as critics for RL
+
+    directory: Description
+    score_type: Must be one of the following:
+                SA, TPSA, QED, LogP, CSP3
+    """
+
     token = Tokenizer(directory)
-    dataset = adcDataset(directory)
+    dataset = adcDataset(directory, score_type=score_type)
     loader = DataLoader(
         dataset,
         batch_size=64,
@@ -470,12 +541,12 @@ def train_LSTM_scores(directory):
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    print(f"Training on device: {device}")
+    print(f"Training {score_type} score on device {device}")
 
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 
-    num_epochs = 20
+    num_epochs = 100
 
     for epoch in range(num_epochs):
         for i, (smile, score) in enumerate(loader):
@@ -495,10 +566,10 @@ def train_LSTM_scores(directory):
     return model
 
 
-def test_LSTM_scores(directory, model):
+def test_LSTM_scores(directory, model, score_type):
 
     token = Tokenizer(directory)
-    dataset = adcDataset(directory)
+    dataset = adcDataset(directory, score_type=score_type)
     loader = DataLoader(
         dataset,
         batch_size=1000,
@@ -508,7 +579,7 @@ def test_LSTM_scores(directory, model):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    print(f"Training on device: {device}")
+    print(f"Testing {score_type} score model on device {device}")
 
     SA_predictions = []
     SA_true = []
@@ -650,9 +721,28 @@ def generate_smiles(model, directory):
     return sequence
 
 
-def LSTM_model_RL(score_model, gen_model, token, total_frames=500_000):
+def LSTM_model_RL(
+    SA_model,
+    TPSA_model,
+    QED_model,
+    LogP_model,
+    CSP3_model,
+    gen_model,
+    critic_model,
+    token,
+    total_frames=500_000,
+):
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.modules.tensordict_module.ProbabilisticActor.html
     # creating a dict for our LSTM generative model that the actor can then understand for RL
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    SA_model.to(device)
+    TPSA_model.to(device)
+    QED_model.to(device)
+    LogP_model.to(device)
+    CSP3_model.to(device)
+    gen_model.to(device)
+    critic_model.to(device)
 
     # actor is our generative model, critic is our scoring model
     # loss module uses the proximal policy optimization (PPO) from torchRL to calculate loss
@@ -671,20 +761,79 @@ def LSTM_model_RL(score_model, gen_model, token, total_frames=500_000):
         return_log_prob=True,
     )
 
-    score_module = TensorDictModule(
-        module=score_model,
-        in_keys=["observation", "hidden", "cell"],
-        out_keys=["out"],
+    SA_module = TensorDictModule(
+        module=SA_model,
+        in_keys=["observation"],
+        out_keys=["SA_score"],
+    )
+
+    TPSA_module = TensorDictModule(
+        module=TPSA_model,
+        in_keys=["observation"],
+        out_keys=["TPSA_score"],
+    )
+
+    QED_module = TensorDictModule(
+        module=QED_model,
+        in_keys=["observation"],
+        out_keys=["QED_score"],
+    )
+
+    LogP_module = TensorDictModule(
+        module=LogP_model,
+        in_keys=["observation"],
+        out_keys=["LogP_score"],
+    )
+
+    CSP3_module = TensorDictModule(
+        module=CSP3_model,
+        in_keys=["observation"],
+        out_keys=["CSP3_score"],
+    )
+
+    # theoretical bounds for all scoring metrics
+    SA_min, SA_max = 0.0, 10.0
+    TPSA_min, TPSA_max = 0.0, 700  # not theoretical, just higher than max in dataset
+    QED_min, QED_max = 0.0, 1.0
+    LogP_min, LogP_max = (
+        -10.0,
+        15.0,
+    )  # not theoretical, just lower/higher than min/max in dataset
+    CSP3_min, CSP3_max = 0.0, 1.0
+
+    def aggregate_scores(SA, TPSA, QED, LogP, CSP3):
+        SA_norm = (SA - SA_min) / (SA_max - SA_min)
+        TPSA_norm = (TPSA - TPSA_min) / (TPSA_max - TPSA_min)
+        QED_norm = (QED - QED_min) / (QED_max - QED_min)
+        LogP_norm = (LogP - LogP_min) / (LogP_max - LogP_min)
+        CSP3_norm = (CSP3 - CSP3_min) / (CSP3_max - CSP3_min)
+
+        reward_SA = torch.clamp(1 - SA_norm, 0.0, 1.0)
+        reward_TPSA = torch.clamp(1 - TPSA_norm, 0.0, 1.0)
+        reward_QED = torch.clamp(QED_norm, 0.0, 1.0)
+        reward_LogP = torch.clamp(1 - LogP_norm, 0.0, 1.0)
+        reward_CSP3 = torch.clamp(CSP3_norm, 0.0, 1.0)
+
+        return reward_SA + reward_TPSA + reward_QED + reward_LogP + reward_CSP3
+
+    aggregate_module = TensorDictModule(
+        aggregate_scores,
+        in_keys=["SA_score", "TPSA_score", "QED_score", "LogP_score", "CSP3_score"],
+        out_keys=["reward"],
+    )
+
+    reward_module = TensorDictSequential(
+        SA_module, TPSA_module, QED_module, LogP_module, CSP3_module, aggregate_module
     )
 
     critic_module = ValueOperator(
-        module=score_module, in_keys=["observation", "hidden", "cell"]
+        module=critic_model, in_keys=["observation", "hidden", "cell"]
     )
 
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.collectors.SyncDataCollector.html
 
     environment_maker = lambda: SmilesGeneratorEnv(
-        score_model,
+        reward_module,
         vocab_size=len(token.smiles_map),
         max_length=50,
         num_layers=gen_model.layer_dim,
@@ -770,12 +919,37 @@ def LSTM_model_RL(score_model, gen_model, token, total_frames=500_000):
     return gen_model
 
 
-def check_sequences(score_model, gen_model, directory, num_samples=100):
+def check_sequences(
+    SA_model,
+    TPSA_model,
+    QED_model,
+    LogP_model,
+    CSP3_model,
+    gen_model,
+    directory,
+    num_samples=100,
+):
     valid_smiles = 0
-    scores = []
+    SA_scores = []
+    TPSA_scores = []
+    QED_scores = []
+    LogP_scores = []
+    CSP3_scores = []
 
-    device = next(score_model.parameters()).device
-    score_model.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    SA_model.to(device)
+    TPSA_model.to(device)
+    QED_model.to(device)
+    LogP_model.to(device)
+    CSP3_model.to(device)
+    gen_model.to(device)
+
+    SA_model.eval()
+    TPSA_model.eval()
+    QED_model.eval()
+    LogP_model.eval()
+    CSP3_model.eval()
 
     for _ in range(num_samples):
         sequence = generate_smiles(gen_model, directory)
@@ -787,50 +961,61 @@ def check_sequences(score_model, gen_model, directory, num_samples=100):
             seq_tensor = torch.tensor(sequence, device=device).unsqueeze(0)
 
             with torch.no_grad():
-                score = score_model(seq_tensor)
-                scores.append(score)
+                SA_score = SA_model(seq_tensor)
+                TPSA_score = TPSA_model(seq_tensor)
+                QED_score = QED_model(seq_tensor)
+                LogP_score = LogP_model(seq_tensor)
+                CSP3_score = CSP3_model(seq_tensor)
+
+                SA_scores.append(SA_score.cpu().numpy())
+                TPSA_scores.append(TPSA_score.cpu().numpy())
+                QED_scores.append(QED_score.cpu().numpy())
+                LogP_scores.append(LogP_score.cpu().numpy())
+                CSP3_scores.append(CSP3_score.cpu().numpy())
 
     print("-" * 30)
     print(f"Valid smiles = {valid_smiles}%")
-    print(f"Average SA score = {np.mean(scores):.4f}")
-    print(f"Std Dev SA score = {np.std(scores):.4f}")
+    print(f"Avg SA = {np.mean(SA_scores):.4f}\t\tStd Dev = {np.std(SA_scores):.4f}")
+    print(f"Avg TPSA = {np.mean(TPSA_scores):.4f}\tStd Dev = {np.std(TPSA_scores):.4f}")
+    print(f"Avg QED = {np.mean(QED_scores):.4f}\tStd Dev = {np.std(QED_scores):.4f}")
+    print(f"Avg LogP = {np.mean(LogP_scores):.4f}\tStd Dev = {np.std(LogP_scores):.4f}")
+    print(f"Avg CSP3 = {np.mean(CSP3_scores):.4f}\tStd Dev = {np.std(CSP3_scores):.4f}")
     print("-" * 30)
 
 
 if __name__ == "__main__":
-    # Load our ADC dataset
+
+    """Load our ADC dataset"""
     adc_directory = "data/adc_data_complete_v2.pkl"
     df = pd.read_pickle(adc_directory)
 
-    # # Perform k-folds on sequence to one model to assess hyperparameters
+    """Perform k-folds on sequence to one model to assess hyperparameters"""
     # kfolds_LSTM_scores(adc_directory)
 
-    # # train the model on the entire dataset and save the result
-    # model_scores = train_LSTM_scores(adc_directory)
-    # test_LSTM_scores(adc_directory, model_scores)
-    # torch.save(model_scores.state_dict(), "models/model_scores_weights.pth")
+    """train the scoring models"""
+    # training_scores = ["SA", "TPSA", "QED", "LogP", "CSP3"]
 
-    # # train the sequence to sequence generative model
+    # for score in training_scores:
+    #     model = train_LSTM_scores(adc_directory, score_type=score)
+    #     test_LSTM_scores(adc_directory, model, score_type=score)
+    #     torch.save(model.state_dict(), f"models/{score}_scores_weights.pth")
+
+    """train the sequence to sequence generative model"""
     # model_gen = train_LSTM_gen(adc_directory, num_epochs=200)
     # torch.save(model_gen.state_dict(), "models/model_gen_weights.pth")
 
-    # generate a new sequence from our trained generator model
+    """Perform RL training on generative model"""
     token = Tokenizer(adc_directory)
-    model_gen = LSTMGenModel(
+
+    gen_model = LSTMGenModel(
         input_dim=128,
         hidden_dim=256,
         layer_dim=5,
         output_dim=len(token.smiles_map),
         directory=adc_directory,
     )
-    model_gen.load_state_dict(
-        torch.load("models/model_gen_weights.pth", weights_only=True)
-    )
-    # sequence = generate_smiles(model_gen, adc_directory)
-    # print(token.tokens_to_smiles(sequence))
-    # print(len(sequence))
 
-    model_score = LSTMScoreModel(
+    critic_model = CriticModel(
         input_dim=128,
         hidden_dim=256,
         layer_dim=5,
@@ -838,14 +1023,85 @@ if __name__ == "__main__":
         directory=adc_directory,
     )
 
-    model_score.load_state_dict(
-        torch.load("models/model_scores_weights.pth", weights_only=True)
+    SA_model = LSTMScoreModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        output_dim=1,
+        directory=adc_directory,
     )
 
-    # RL_trained_model = LSTM_model_RL(model_score, model_gen, token)
+    TPSA_model = LSTMScoreModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        output_dim=1,
+        directory=adc_directory,
+    )
+
+    QED_model = LSTMScoreModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        output_dim=1,
+        directory=adc_directory,
+    )
+
+    LogP_model = LSTMScoreModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        output_dim=1,
+        directory=adc_directory,
+    )
+
+    CSP3_model = LSTMScoreModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        output_dim=1,
+        directory=adc_directory,
+    )
+
+    gen_model.load_state_dict(
+        torch.load("models/model_gen_weights.pth", weights_only=True)
+    )
+
+    SA_model.load_state_dict(
+        torch.load("models/SA_scores_weights.pth", weights_only=True)
+    )
+
+    TPSA_model.load_state_dict(
+        torch.load("models/TPSA_scores_weights.pth", weights_only=True)
+    )
+
+    QED_model.load_state_dict(
+        torch.load("models/QED_scores_weights.pth", weights_only=True)
+    )
+
+    LogP_model.load_state_dict(
+        torch.load("models/LogP_scores_weights.pth", weights_only=True)
+    )
+
+    CSP3_model.load_state_dict(
+        torch.load("models/CSP3_scores_weights.pth", weights_only=True)
+    )
+
+    # RL_trained_model = LSTM_model_RL(
+    #     SA_model=SA_model,
+    #     TPSA_model=TPSA_model,
+    #     QED_model=QED_model,
+    #     LogP_model=LogP_model,
+    #     CSP3_model=CSP3_model,
+    #     gen_model=gen_model,
+    #     critic_model=critic_model,
+    #     token=token,
+    # )
+
     # torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
 
-    model_gen_RL = LSTMGenModel(
+    """Test RL model"""
+    gen_RL_model = LSTMGenModel(
         input_dim=128,
         hidden_dim=256,
         layer_dim=5,
@@ -853,19 +1109,43 @@ if __name__ == "__main__":
         directory=adc_directory,
     )
 
-    model_gen_RL.load_state_dict(
+    gen_RL_model.load_state_dict(
         torch.load("models/model_RL_gen_weights.pth", weights_only=True)
     )
 
-    # print()
-    # print("Sequence generated after RL training:")
-    # sequence = generate_smiles(model_gen_RL, adc_directory)
-    # print(token.tokens_to_smiles(sequence))
-    # print(len(sequence))
+    print()
+    print("Sequence generated after RL training:")
+    sequence = generate_smiles(gen_RL_model, adc_directory)
+    print(token.tokens_to_smiles(sequence))
+    print(len(sequence))
 
+    print()
     print("Pre-RL model: ")
-    check_sequences(model_score, model_gen, directory=adc_directory)
+    check_sequences(
+        SA_model=SA_model,
+        TPSA_model=TPSA_model,
+        QED_model=QED_model,
+        LogP_model=LogP_model,
+        CSP3_model=CSP3_model,
+        gen_model=gen_model,
+        directory=adc_directory,
+    )
 
     print()
     print("RL model:")
-    check_sequences(model_score, model_gen_RL, directory=adc_directory)
+    check_sequences(
+        SA_model=SA_model,
+        TPSA_model=TPSA_model,
+        QED_model=QED_model,
+        LogP_model=LogP_model,
+        CSP3_model=CSP3_model,
+        gen_model=gen_RL_model,
+        directory=adc_directory,
+    )
+
+    # features notes
+    # SA - minimize
+    # CSP3 - maximize
+    # TPSA - minimize, above 140 is bad
+    # QED - maximize
+    # LogP - minimize <5
