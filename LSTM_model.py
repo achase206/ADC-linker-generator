@@ -37,12 +37,12 @@ rdBase.DisableLog("rdApp.error")
 
 
 class Tokenizer:
-    def __init__(self, directory):
+    def __init__(self, df):
         self.SMI_REGEX = re.compile(
             r"(\[[^\]]+]|Br?|Cl?|N|O|S|P|F|I|B|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\|\/|:|@|\?|>|\*|\$|\%[0-9]{2}|[0-9])"
         )
-        df = pd.read_pickle(directory)
-        self.smiles_map = self.smiles_tokenizer(df)
+        self.df = df
+        self.smiles_map = self.smiles_tokenizer(self.df)
         self.inv_smiles_map = self.smiles_detokenizer()
 
         self.pad_token = self.smiles_map["PAD"]
@@ -82,6 +82,20 @@ class Tokenizer:
                 ".",
                 ":",
                 "@",
+                "c",
+                "n",
+                "o",
+                "s",
+                "p",
+                "C",
+                "N",
+                "O",
+                "S",
+                "P",
+                "F",
+                "I",
+                "Cl",
+                "Br",
             ]
         )
 
@@ -112,6 +126,10 @@ class Tokenizer:
     def tokens_to_smiles(self, smile_token_list):
         smiles_patterns = []
         for token in smile_token_list:
+            if token == self.end_token:
+                break
+            if token in [self.start_token, self.pad_token]:
+                continue
             if hasattr(token, "item"):
                 token = token.item()
             smiles_patterns.append(self.inv_smiles_map[token])
@@ -230,6 +248,12 @@ class LSTMGenModel(nn.Module):
     def forward(
         self, sequence, antibody, payload, target, hidden_state=None, cell_state=None
     ):
+        # need to cast these to ensure that indices are ints, not floats, was getting a weird error
+        sequence = sequence.long()
+        antibody = antibody.long()
+        payload = payload.long()
+        target = target.long()
+
         # on first pass initialize hidden and cell states to zeros
         if hidden_state is None or cell_state is None:
             hidden_state = torch.zeros(
@@ -318,6 +342,11 @@ class CriticModel(nn.Module):
         self.fc = nn.Linear(hidden_dim, output_dim)
 
     def forward(self, sequence, antibody, payload, target, hidden=None, cell=None):
+        # need to cast these to ensure that indices are ints, not floats, was getting a weird error
+        sequence = sequence.long()
+        antibody = antibody.long()
+        payload = payload.long()
+        target = target.long()
 
         # smiles sequence embedding
         embedded_seq = self.token_embedding(sequence)
@@ -358,20 +387,27 @@ class CriticModel(nn.Module):
         else:
             out, _ = self.lstm(lstm_input)
 
-        out = out[:, -1, :]  # Take last time step
+        # out = out[:, -1, :]  # Take last time step
         out = self.fc(out)  # final layer
 
-        return out
+        # out is [batch, seq_len, 1], loss needs [batch, seq_len]
+        return out.squeeze(-1)
 
 
 class adcDataset(Dataset):
 
     def __init__(
-        self, directory, tokenizer, stoi_dicts, score_type="SA", augment=False
+        self,
+        df,
+        tokenizer,
+        stoi_dicts,
+        score_type="SA",
+        augment=False,
+        source_type="real",
     ):
-        self.directory = directory
+        self.df = df[df["data_type"] == source_type]
         self.tokenizer = tokenizer
-        self.file = pd.read_pickle(directory)
+        self.file = self.df
         self.smiles = (
             self.file["smiles"]
             .str.findall(self.tokenizer.SMI_REGEX)
@@ -470,7 +506,7 @@ class SmilesGeneratorEnv(EnvBase):
         tokenizer,
         device="cuda",
         seed=None,
-        condition_count=4,
+        condition_count=5,
     ):
         super().__init__(
             device=device, batch_size=[]
@@ -489,6 +525,10 @@ class SmilesGeneratorEnv(EnvBase):
 
         # holds the sequence that we generate for each batch
         self.generated_sequence = []
+
+        # generates our heads, tails and cleavables patterns for rewards
+        self.structural_strings = adc_motifs_clean
+        self.structural_patterns = compile_motifs(adc_motifs_clean)
 
         # need to define the specs for TorchRL to work
         # essentially telling the torchRL what the output from the generative model will look like
@@ -536,12 +576,32 @@ class SmilesGeneratorEnv(EnvBase):
         self.current_step = 0
         self.generated_sequence = []
 
-        start_token = torch.tensor([self.token.smiles_map["START"]], device=self.device)
+        # occasionally give the model a hint of where to start
+        use_prompt = torch.rand(1).item() < 0.3
+
+        if use_prompt:
+            prompt_smiles = random.choice(self.structural_strings["heads"])
+            prompt_tokens = self.token.SMI_REGEX.findall(prompt_smiles)
+            prompt_ids = self.token.smiles_to_tokens(prompt_tokens)
+
+            self.generated_sequence.extend(prompt_ids)
+            self.current_step = len(prompt_ids)
+
+            # set the last token of prompt as the current observation
+            last_token = prompt_ids[-1]
+            start_token = torch.tensor([last_token], device=self.device)
+
+        else:
+
+            start_token = torch.tensor(
+                [self.token.smiles_map["START"]], device=self.device
+            )
 
         # select random conditions for this generation cycle
-        ab_idx = torch.randint(0, self.condition_count, (1,), device=self.device)
-        pay_idx = torch.randint(0, self.condition_count, (1,), device=self.device)
-        tar_idx = torch.randint(0, self.condition_count, (1,), device=self.device)
+        # exclude unknown condition, key=0
+        ab_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
+        pay_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
+        tar_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
 
         reset_observation = TensorDict(
             {
@@ -565,6 +625,38 @@ class SmilesGeneratorEnv(EnvBase):
 
         return reset_observation
 
+    def calculate_structural_reward(self, mol):
+        reward = 0.0
+        found_parts = {"heads": False, "cleavable": False, "tails": False}
+
+        for pattern in self.structural_patterns["heads"]:
+            if mol.HasSubstructMatch(pattern):
+                reward += 1.0
+                found_parts["heads"] = True
+                break
+
+        for pattern in self.structural_patterns["tails"]:
+            if mol.HasSubstructMatch(pattern):
+                reward += 1.0
+                found_parts["tails"] = True
+                break
+
+        for pattern in self.structural_patterns["cleavable"]:
+            if mol.HasSubstructMatch(pattern):
+                reward += 1.0
+                found_parts["cleavable"] = True
+                break
+
+        # reward moderate success for multiple parts
+        if found_parts["heads"] and found_parts["cleavable"]:
+            reward += 2.0
+
+        # reward huge success for all critical adc parts
+        if found_parts["heads"] and found_parts["cleavable"] and found_parts["tails"]:
+            reward += 5.0
+
+        return reward
+
     def _step(self, tensordict):
         # get the action token from the actor dict
         action_token = tensordict["action"]
@@ -576,7 +668,8 @@ class SmilesGeneratorEnv(EnvBase):
 
         # determine if action resulted in our end token, if so terminate loop
         # also check if we are at our max length for a possible sequence
-        is_end = action_token == self.token.end_token
+        token_id = action_token.item()
+        is_end = token_id == self.token.end_token
         is_max = self.current_step >= self.max_length
         done = is_end | is_max
 
@@ -585,8 +678,13 @@ class SmilesGeneratorEnv(EnvBase):
         pay_idx = tensordict["payload"]
         tar_idx = tensordict["target"]
 
+        # sequences were maximizing length to max out reward even though this doesn't make sense
+        # every step slightly lowers the total reward
+        # goal is for a good short molecule to be better than a good max length one
+        step_penalty = 0.05
+        reward = -step_penalty
+
         # if we are done generating our sequence then calculate the reward
-        reward = 0.0
         if done:
 
             # check to see if we got a real molecule, penalize if not
@@ -596,6 +694,7 @@ class SmilesGeneratorEnv(EnvBase):
             if mol is None:
                 # an invalid smiles string was generated
                 raw_reward = -0.5
+                struct_reward = 0.0
 
             else:
                 # matches model device if on cuda
@@ -616,7 +715,9 @@ class SmilesGeneratorEnv(EnvBase):
 
                 raw_reward = score_input["reward"].item()
 
-            reward = raw_reward * 10.0
+                struct_reward = self.calculate_structural_reward(mol)
+
+            reward = (raw_reward * 10.0) + struct_reward
 
         # pass along info for next iterations, observation is just our action for the step
         # reward is 0 if not done and done and terminated are false if we haven't reached "END" or max length
@@ -649,7 +750,7 @@ def conditions_tokens(df):
     conditions = ["antibody_name", "payload_name", "indication"]
     stoi_dicts = []
     itos_dicts = []
-    dict_length = 4
+    dict_length = 5
     for condition in conditions:
         stoi, itos = conditions_mapping(condition, dict_length)
         stoi_dicts.append(stoi)
@@ -842,7 +943,7 @@ def test_LSTM_scores(dataset, tokenizer, model, score_type):
     print(f"Mean Absolute Error: {mae:.4f}")
 
 
-def train_LSTM_gen(model, dataset, tokenizer, stoi_dicts, num_epochs=1000):
+def train_LSTM_gen(model, dataset, tokenizer, learning_rate=0.001, num_epochs=1000):
     batch_size = 64
     loader = DataLoader(
         dataset,
@@ -859,7 +960,7 @@ def train_LSTM_gen(model, dataset, tokenizer, stoi_dicts, num_epochs=1000):
     criterion = nn.CrossEntropyLoss(
         ignore_index=tokenizer.pad_token
     )  # ignore the padding for loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     for epoch in range(num_epochs):
         for i, (smile, ab, pay, target, score) in enumerate(loader):
@@ -915,7 +1016,7 @@ def generate_smiles(model, directory):
 
     sequence = []
 
-    max_smiles_length = 50
+    max_smiles_length = 100
     with torch.no_grad():
         for i in range(max_smiles_length):
 
@@ -966,6 +1067,7 @@ def LSTM_model_RL(
     gen_model,
     critic_model,
     tokenizer,
+    learning_rate=0.00001,
     temperature=0.7,
     total_frames=500_000,
 ):
@@ -1072,6 +1174,9 @@ def LSTM_model_RL(
         SA_module, TPSA_module, QED_module, LogP_module, CSP3_module, aggregate_module
     )
 
+    # critic forward pass
+    # def forward(self, batch_size, sequence, antibody, payload, target, hidden=None, cell=None)
+
     critic_module = ValueOperator(
         module=critic_model,
         in_keys=["observation", "antibody", "payload", "target", "hidden", "cell"],
@@ -1082,7 +1187,7 @@ def LSTM_model_RL(
     environment_maker = lambda: SmilesGeneratorEnv(
         reward_module,
         vocab_size=tokenizer.vocab_size,
-        max_length=50,
+        max_length=100,
         num_layers=gen_model.layer_dim,
         hidden_dim=gen_model.hidden_dim,
         tokenizer=tokenizer,
@@ -1117,7 +1222,7 @@ def LSTM_model_RL(
         actor=actor_module.to("cuda"),
         critic=critic_module.to("cuda"),
         clip_epsilon=0.2,  # default hyperparam
-        entropy_bonus=0.0001,  # encourages exploration to prevent same output
+        entropy_bonus=0.01,  # encourages exploration to prevent same output
         normalize_advantage=True,
     )
 
@@ -1179,6 +1284,7 @@ def LSTM_model_RL(
 
         # check how we are doing every 5 batches
         if i % 5 == 0:
+            print()
             print(f"----- Batch {i} Monitor -----")
             sequence_tokens = batch["next", "observation"][0].cpu().numpy()
             smiles = tokenizer.tokens_to_smiles(list(sequence_tokens))
@@ -1280,7 +1386,7 @@ def generate_smiles_conditional(
 
     sequence = []
 
-    max_smiles_length = 50
+    max_smiles_length = 100
     with torch.no_grad():
         for i in range(max_smiles_length):
 
@@ -1416,7 +1522,195 @@ def check_sequences_conditional(
     print("-" * 30)
 
 
+def generate_valid_linkers(
+    adc_motifs,
+    SA_model,
+    TPSA_model,
+    QED_model,
+    LogP_model,
+    CSP3_model,
+    gen_model,
+    tokenizer,
+    ab_idx,
+    pay_idx,
+    tar_idx,
+    target_count=10,
+    max_attempts=10000,
+    temperature=1.0,
+):
+    valid_smiles = 0
+    SA_scores = []
+    TPSA_scores = []
+    QED_scores = []
+    LogP_scores = []
+    CSP3_scores = []
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    SA_model.to(device)
+    TPSA_model.to(device)
+    QED_model.to(device)
+    LogP_model.to(device)
+    CSP3_model.to(device)
+    gen_model.to(device)
+
+    SA_model.eval()
+    TPSA_model.eval()
+    QED_model.eval()
+    LogP_model.eval()
+    CSP3_model.eval()
+
+    gen_model.to(device)
+
+    structural_patterns = {
+        k: [Chem.MolFromSmiles(s) for s in v if Chem.MolFromSmiles(s)]
+        for k, v in adc_motifs_clean.items()
+    }
+
+    def check_structure(mol):
+        has_head = any(
+            mol.HasSubstructMatch(pat) for pat in structural_patterns["heads"]
+        )
+        if not has_head:
+            return False
+        has_cleave = any(
+            mol.HasSubstructMatch(pat) for pat in structural_patterns["cleavable"]
+        )
+        if not has_cleave:
+            return False
+        has_tail = any(
+            mol.HasSubstructMatch(pat) for pat in structural_patterns["tails"]
+        )
+        return has_tail
+
+    valid_linkers = 0
+    linkers = []
+    attempts = 0
+    while (valid_linkers < target_count) and (attempts < max_attempts):
+        sequence = generate_smiles_conditional(
+            model=gen_model,
+            tokenizer=tokenizer,
+            ab_idx=ab_idx,
+            pay_idx=pay_idx,
+            tar_idx=tar_idx,
+            temperature=temperature,
+        )
+        attempts += 1
+        smiles = tokenizer.tokens_to_smiles(sequence)
+
+        if Chem.MolFromSmiles(smiles) is not None:
+            valid_smiles += 1
+            seq_tensor = torch.tensor(sequence, device=device).unsqueeze(0)
+
+            mol = Chem.MolFromSmiles(smiles)
+
+            if check_structure(mol):
+                valid_linkers += 1
+                linkers.append(smiles)
+
+                with torch.no_grad():
+                    SA_score = SA_model(seq_tensor)
+                    TPSA_score = TPSA_model(seq_tensor)
+                    QED_score = QED_model(seq_tensor)
+                    LogP_score = LogP_model(seq_tensor)
+                    CSP3_score = CSP3_model(seq_tensor)
+
+                    SA_scores.append(SA_score.cpu().numpy())
+                    TPSA_scores.append(TPSA_score.cpu().numpy())
+                    QED_scores.append(QED_score.cpu().numpy())
+                    LogP_scores.append(LogP_score.cpu().numpy())
+                    CSP3_scores.append(CSP3_score.cpu().numpy())
+
+    print("-" * 30)
+    print(f"Avg SA = {np.mean(SA_scores):.4f}\t\tStd Dev = {np.std(SA_scores):.4f}")
+    print(f"Avg TPSA = {np.mean(TPSA_scores):.4f}\tStd Dev = {np.std(TPSA_scores):.4f}")
+    print(f"Avg QED = {np.mean(QED_scores):.4f}\tStd Dev = {np.std(QED_scores):.4f}")
+    print(f"Avg LogP = {np.mean(LogP_scores):.4f}\tStd Dev = {np.std(LogP_scores):.4f}")
+    print(f"Avg CSP3 = {np.mean(CSP3_scores):.4f}\tStd Dev = {np.std(CSP3_scores):.4f}")
+    print("-" * 30)
+
+    return linkers
+
+
+def compile_motifs(motif_dict):
+    patterns = {"heads": [], "cleavable": [], "tails": []}
+    for category, smiles in motif_dict.items():
+        for smile in smiles:
+            mol = Chem.MolFromSmiles(smile)
+            if mol:
+                patterns[category].append(mol)
+    return patterns
+
+
 if __name__ == "__main__":
+
+    adc_motifs_clean = {
+        "cleavable": [
+            # --- Original Cleavables ---
+            "c1ccccc1",  # PABC Core (Benzene)
+            "SS",  # Disulfide Bond
+            "CC(C)[C@@H]C=O",  # Valine Backbone
+            "CCC(=O)NNC=O",  # Hydrazone
+            # --- New Additions (Functional/Peptides) ---
+            "CC[C@@H]C=O",  # Alanine
+            "OC(=O)[C@@H](CCC)C=O",  # Glutamic acid derivative
+            "Oc1ccc(N=Nc2ccccc2)cc1",  # Azo-linker
+            "O=[N+]([O-])c1ccccc1",  # Nitro-aromatic
+            "NC(=O)[C@@H](CCCC)C=O",  # Citrulline/Glutamine sidechain
+            "CC(C)CC=O",  # Valine derivative
+            "OC(=O)[C@@H](CCC=O)CC=O",  # Glutamic acid
+            "OC(=O)[C@@H](CCCC)C=O",  # Lysine/Ornithine
+        ],
+        "heads": [
+            # --- Standard Conjugation ---
+            "O=C1C=CC(=O)N1",  # Maleimide
+            "O=C1CCC(=O)N1O",  # NHS Ester
+            "O=C1CC(S(=O)(=O)O)C(=O)N1O",  # Sulfo-NHS
+            "CCBr",  # Bromoethyl
+            "O=CCBr",  # Bromoacetyl
+            "O=C1N[C@@H]2[C@H](S1)NC2",  # Biotin (Core ring structure)
+            "CCC(=O)NN",  # Hydrazide
+            "O=Cc1ccccc1",  # Benzaldehyde
+            # --- Click Chemistry ---
+            "CCN=[N+]=[N-]",  # Azide
+            "CC#C",  # Alkyne
+            "C#Cc1ccccc1",  # DBCO fragment (simplified)
+            "C1=CCCC=CC1",  # TCO (Cyclooctene core)
+            "Cc1nnc[nH]1",  # Tetrazine/Triazine core
+            "C#CC1CC2CC1C2",  # BCN Core
+            "C#CC1CCCCC1",  # Cyclooctyne variant
+            # --- Activated Esters / Leaving Groups ---
+            "Fc1c(F)c(F)c(F)c(F)F",  # PFP (Pentafluorobenzene)
+            "Fc1cc(F)c(F)c1F",  # TFP
+            "O=[N+]([O-])c1ccccc1",  # Nitrophenyl
+            "O=[N+]([O-])c1cc([N+](=O)[O-])ccc1",  # Dinitrophenyl
+            "Cc1ccc(S(=O)(=O)O)cc1",  # Tosylate
+            "CS(=O)(=O)O",  # Mesylate
+        ],
+        "tails": [
+            # --- Functional Tails ---
+            "CCC(=O)O",  # Propionic Acid
+            "CC(=O)O",  # Acetic Acid
+            "CCN",  # Ethylamine
+            "CN",  # Methylamine
+            "c1ccccc1",  # Phenyl
+            "CCS",  # Thiol
+            "CC(=O)S",  # Thioacetate
+            "CO",  # Hydroxylamine (Methoxy/Alcohol)
+            # --- Caps & Protecting Groups ---
+            "CC(C)(C)C",  # t-Butyl
+            "CC1c2ccccc2-c2ccccc21",  # Fluorenyl
+            "CCO",  # Ether/Alcohol
+            "CO",  # Methoxy
+            "CC",  # Ethyl
+            "c1ccncc1",  # Pyridine
+            "NC=O",  # Amide
+            "CCS(=O)(=O)O",  # Sulfonate
+            "CO",  # Methoxy variant
+            "CC=O",  # Acetyl
+            "CC(=O)CCC=O",  # Levulinyl
+        ],
+    }
 
     """Load our full ADC dataset"""
     # full_dataset_directory = "data/adc_data_complete_v2.pkl"
@@ -1432,19 +1726,46 @@ if __name__ == "__main__":
     # df_filtered.to_pickle("data/adc_data_filtered.pkl")
     """Get list of dicts for condition tokens"""
     adc_directory = "data/adc_data_filtered.pkl"
+    synthetic_directory = "data/synthetic_data.pkl"
 
-    tokenizer = Tokenizer(adc_directory)
+    adc_df = pd.read_pickle(adc_directory)
+    synth_df = pd.read_pickle(synthetic_directory)
+    synth_df["data_type"] = "synthetic"
 
-    df = pd.read_pickle(adc_directory)
+    combo_df = pd.concat([adc_df, synth_df])
+    combo_df["indication"] = combo_df["indication"].fillna("unknown")
+    combo_df["antibody_name"] = combo_df["antibody_name"].fillna("unknown")
+    combo_df["payload_name"] = combo_df["payload_name"].fillna("unknown")
+    combo_df["data_type"] = combo_df["data_type"].fillna("real")
+    combo_df = combo_df.fillna(0.0)
 
-    stoi_dicts, itos_dicts, dict_lengths = conditions_tokens(df)
+    tokenizer = Tokenizer(combo_df)
 
-    # easy_dataset = adcDataset(
-    #     directory=adc_directory,
-    #     tokenizer=tokenizer,
-    #     stoi_dicts=stoi_dicts,
-    #     augment=False,
-    # )
+    stoi_dicts, itos_dicts, dict_lengths = conditions_tokens(combo_df)
+
+    synth_dataset = adcDataset(
+        df=combo_df,
+        tokenizer=tokenizer,
+        stoi_dicts=stoi_dicts,
+        augment=False,
+        source_type="synthetic",
+    )
+
+    easy_dataset = adcDataset(
+        df=combo_df,
+        tokenizer=tokenizer,
+        stoi_dicts=stoi_dicts,
+        augment=False,
+        source_type="real",
+    )
+
+    hard_dataset = adcDataset(
+        df=combo_df,
+        tokenizer=tokenizer,
+        stoi_dicts=stoi_dicts,
+        augment=True,
+        source_type="real",
+    )
 
     """Perform k-folds on sequence to one model to assess hyperparameters"""
     # kfolds_LSTM_scores(adc_directory)
@@ -1462,35 +1783,34 @@ if __name__ == "__main__":
     #     torch.save(model.state_dict(), f"models/{score}_scores_weights.pth")
 
     """train the sequence to sequence generative model"""
-    # hard_dataset = adcDataset(
-    #     directory=adc_directory,
-    #     tokenizer=tokenizer,
-    #     stoi_dicts=stoi_dicts,
-    #     augment=True,
-    # )
 
-    # easy_dataset = adcDataset(
-    #     directory=adc_directory,
-    #     tokenizer=tokenizer,
-    #     stoi_dicts=stoi_dicts,
-    #     augment=False,
-    # )
+    gen_model = LSTMGenModel(
+        input_dim=128,
+        hidden_dim=256,
+        layer_dim=5,
+        vocab_size=tokenizer.vocab_size,
+        padding_idx=tokenizer.pad_token,
+        output_dim=tokenizer.vocab_size,
+        condition_count=5,
+    )
 
-    # gen_model = LSTMGenModel(
-    #     input_dim=128,
-    #     hidden_dim=256,
-    #     layer_dim=5,
-    #     vocab_size=tokenizer.vocab_size,
-    #     padding_idx=tokenizer.pad_token,
-    #     output_dim=tokenizer.vocab_size,
-    #     condition_count=4,
+    # model_gen = train_LSTM_gen(
+    #     model=gen_model,
+    #     dataset=synth_dataset,
+    #     tokenizer=tokenizer,
+    #     learning_rate=0.001,
+    #     num_epochs=100,
+    # )
+    # torch.save(model_gen.state_dict(), "models/model_gen_weights.pth")
+    # gen_model.load_state_dict(
+    #     torch.load("models/model_gen_weights.pth", weights_only=True)
     # )
 
     # model_gen = train_LSTM_gen(
     #     model=gen_model,
     #     dataset=easy_dataset,
     #     tokenizer=tokenizer,
-    #     stoi_dicts=stoi_dicts,
+    #     learning_rate=0.0001,
     #     num_epochs=50,
     # )
     # torch.save(model_gen.state_dict(), "models/model_gen_weights.pth")
@@ -1502,13 +1822,57 @@ if __name__ == "__main__":
     #     model=gen_model,
     #     dataset=hard_dataset,
     #     tokenizer=tokenizer,
-    #     stoi_dicts=stoi_dicts,
-    #     num_epochs=100,
+    #     learning_rate=0.0001,
+    #     num_epochs=150,
     # )
 
     # torch.save(model_gen.state_dict(), "models/model_gen_weights.pth")
 
     """test the sequence to sequence generative model with conditions"""
+
+    # SA_model = LSTMScoreModel(
+    #     input_dim=128, hidden_dim=256, layer_dim=5, output_dim=1, tokenizer=tokenizer
+    # )
+
+    # TPSA_model = LSTMScoreModel(
+    #     input_dim=128, hidden_dim=256, layer_dim=5, output_dim=1, tokenizer=tokenizer
+    # )
+
+    # QED_model = LSTMScoreModel(
+    #     input_dim=128, hidden_dim=256, layer_dim=5, output_dim=1, tokenizer=tokenizer
+    # )
+
+    # LogP_model = LSTMScoreModel(
+    #     input_dim=128, hidden_dim=256, layer_dim=5, output_dim=1, tokenizer=tokenizer
+    # )
+
+    # CSP3_model = LSTMScoreModel(
+    #     input_dim=128, hidden_dim=256, layer_dim=5, output_dim=1, tokenizer=tokenizer
+    # )
+
+    # gen_model.load_state_dict(
+    #     torch.load("models/model_gen_weights.pth", weights_only=True)
+    # )
+
+    # SA_model.load_state_dict(
+    #     torch.load("models/SA_scores_weights.pth", weights_only=True)
+    # )
+
+    # TPSA_model.load_state_dict(
+    #     torch.load("models/TPSA_scores_weights.pth", weights_only=True)
+    # )
+
+    # QED_model.load_state_dict(
+    #     torch.load("models/QED_scores_weights.pth", weights_only=True)
+    # )
+
+    # LogP_model.load_state_dict(
+    #     torch.load("models/LogP_scores_weights.pth", weights_only=True)
+    # )
+
+    # CSP3_model.load_state_dict(
+    #     torch.load("models/CSP3_scores_weights.pth", weights_only=True)
+    # )
 
     # gen_model.load_state_dict(
     #     torch.load("models/model_gen_weights.pth", weights_only=True)
@@ -1517,21 +1881,26 @@ if __name__ == "__main__":
     # sequence = generate_smiles_conditional(
     #     model=gen_model,
     #     tokenizer=tokenizer,
-    #     ab_idx=0,
-    #     pay_idx=0,
-    #     tar_idx=0,
-    #     temperature=0.5,
+    #     ab_idx=1,
+    #     pay_idx=1,
+    #     tar_idx=1,
+    #     temperature=0.6,
     # )
 
     # print(tokenizer.tokens_to_smiles(sequence))
 
     # check_sequences_conditional(
     #     gen_model=gen_model,
+    #     SA_model=SA_model,
+    #     TPSA_model=TPSA_model,
+    #     QED_model=QED_model,
+    #     LogP_model=LogP_model,
+    #     CSP3_model=CSP3_model,
     #     tokenizer=tokenizer,
-    #     ab_idx=0,
-    #     pay_idx=0,
-    #     tar_idx=0,
-    #     temperature=0.5,
+    #     ab_idx=1,
+    #     pay_idx=1,
+    #     tar_idx=1,
+    #     temperature=0.6,
     # )
 
     """Perform RL training on generative model"""
@@ -1543,7 +1912,7 @@ if __name__ == "__main__":
         vocab_size=tokenizer.vocab_size,
         padding_idx=tokenizer.pad_token,
         output_dim=tokenizer.vocab_size,
-        condition_count=4,
+        condition_count=5,
     )
 
     critic_model = CriticModel(
@@ -1553,7 +1922,7 @@ if __name__ == "__main__":
         vocab_size=tokenizer.vocab_size,
         padding_idx=tokenizer.pad_token,
         output_dim=1,
-        condition_count=4,
+        condition_count=5,
     )
 
     SA_model = LSTMScoreModel(
@@ -1609,7 +1978,8 @@ if __name__ == "__main__":
     #     gen_model=gen_model,
     #     critic_model=critic_model,
     #     tokenizer=tokenizer,
-    #     total_frames=100_000,
+    #     learning_rate=0.00001,
+    #     total_frames=1_000_000,
     # )
 
     # torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
@@ -1622,61 +1992,73 @@ if __name__ == "__main__":
         vocab_size=tokenizer.vocab_size,
         padding_idx=tokenizer.pad_token,
         output_dim=tokenizer.vocab_size,
-        condition_count=4,
+        condition_count=5,
     )
 
     gen_RL_model.load_state_dict(
         torch.load("models/model_RL_gen_weights.pth", weights_only=True)
     )
 
+    # linkers = generate_valid_linkers(
+    #     adc_motifs=adc_motifs_clean,
+    #     SA_model=SA_model,
+    #     TPSA_model=TPSA_model,
+    #     QED_model=QED_model,
+    #     LogP_model=LogP_model,
+    #     CSP3_model=CSP3_model,
+    #     gen_model=gen_RL_model,
+    #     tokenizer=tokenizer,
+    #     ab_idx=1,
+    #     pay_idx=1,
+    #     tar_idx=1,
+    #     target_count=5,
+    #     max_attempts=10000,
+    #     temperature=0.8,
+    # )
+
+    # for linker in linkers:
+    #     print(linker)
     print()
     print("Sequence generated after RL training:")
     sequence = generate_smiles_conditional(
         model=gen_RL_model,
         tokenizer=tokenizer,
-        ab_idx=0,
-        pay_idx=0,
-        tar_idx=0,
-        temperature=0.5,
+        ab_idx=1,
+        pay_idx=2,
+        tar_idx=1,
+        temperature=0.4,
     )
     print(tokenizer.tokens_to_smiles(sequence))
     print(len(sequence))
 
-    print()
-    print("Pre-RL model: ")
-    check_sequences_conditional(
-        gen_model=gen_model,
-        SA_model=SA_model,
-        TPSA_model=TPSA_model,
-        QED_model=QED_model,
-        LogP_model=LogP_model,
-        CSP3_model=CSP3_model,
-        tokenizer=tokenizer,
-        ab_idx=0,
-        pay_idx=0,
-        tar_idx=0,
-        temperature=0.5,
-    )
+    # print()
+    # print("Pre-RL model: ")
+    # check_sequences_conditional(
+    #     gen_model=gen_model,
+    #     SA_model=SA_model,
+    #     TPSA_model=TPSA_model,
+    #     QED_model=QED_model,
+    #     LogP_model=LogP_model,
+    #     CSP3_model=CSP3_model,
+    #     tokenizer=tokenizer,
+    #     ab_idx=0,
+    #     pay_idx=0,
+    #     tar_idx=0,
+    #     temperature=0.4,
+    # )
 
-    print()
-    print("RL model:")
-    check_sequences_conditional(
-        gen_model=gen_RL_model,
-        SA_model=SA_model,
-        TPSA_model=TPSA_model,
-        QED_model=QED_model,
-        LogP_model=LogP_model,
-        CSP3_model=CSP3_model,
-        tokenizer=tokenizer,
-        ab_idx=0,
-        pay_idx=0,
-        tar_idx=0,
-        temperature=0.5,
-    )
-
-    # features notes
-    # SA - minimize
-    # CSP3 - maximize
-    # TPSA - minimize, above 140 is bad
-    # QED - maximize
-    # LogP - minimize <5
+    # print()
+    # print("RL model:")
+    # check_sequences_conditional(
+    #     gen_model=gen_RL_model,
+    #     SA_model=SA_model,
+    #     TPSA_model=TPSA_model,
+    #     QED_model=QED_model,
+    #     LogP_model=LogP_model,
+    #     CSP3_model=CSP3_model,
+    #     tokenizer=tokenizer,
+    #     ab_idx=0,
+    #     pay_idx=0,
+    #     tar_idx=0,
+    #     temperature=0.4,
+    # )
