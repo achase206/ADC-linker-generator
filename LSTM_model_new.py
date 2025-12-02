@@ -33,6 +33,12 @@ from rdkit import Chem
 from rdkit import rdBase
 from rdkit.Chem import AllChem
 
+import umap
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
+
 # Disable error messages when a non-valid smiles is encountered
 rdBase.DisableLog("rdApp.error")
 
@@ -82,46 +88,9 @@ class Tokenizer:
             "[",
             "[10Po]",
             "[11Po]",
-            "[12Po]",
-            "[13Po]",
-            "[14Po]",
-            "[15Po]",
-            "[16Po]",
-            "[17Po]",
-            "[18Po]",
-            "[19Po]",
             "[1Po]",
-            "[20Po]",
-            "[21Po]",
-            "[22Po]",
-            "[23Po]",
-            "[24Po]",
-            "[25Po]",
-            "[26Po]",
-            "[27Po]",
-            "[28Po]",
-            "[29Po]",
             "[2Po]",
-            "[30Po]",
-            "[31Po]",
-            "[32Po]",
-            "[33Po]",
-            "[34Po]",
-            "[35Po]",
-            "[36Po]",
-            "[37Po]",
-            "[38Po]",
-            "[39Po]",
             "[3Po]",
-            "[40Po]",
-            "[41Po]",
-            "[42Po]",
-            "[43Po]",
-            "[44Po]",
-            "[45Po]",
-            "[46Po]",
-            "[47Po]",
-            "[48Po]",
             "[4Po]",
             "[5Po]",
             "[6Po]",
@@ -134,7 +103,6 @@ class Tokenizer:
             "[C@H]",
             "[C@]",
             "[CH2]",
-            "[CH3]",
             "[CH]",
             "[N+]",
             "[N-]",
@@ -155,23 +123,6 @@ class Tokenizer:
             "o",
             "p",
             "s",
-            "[49Po]",
-            "[50Po]",
-            "[51Po]",
-            "[52Po]",
-            "[F]",
-            "[Cl]",
-            "[Br]",
-            "[I]",
-            "[B]",
-            "[NH2]",
-            "[S]",
-            "[OH]",
-            "[O]",
-            "[NH]",
-            "[Si]",
-            "[o]",
-            "[cH]",
             "[UNK]",
         ]
 
@@ -511,6 +462,105 @@ class adcDataset(Dataset):
         )
 
 
+class LogitBiasModule(nn.Module):
+    def __init__(
+        self,
+        cleavable_ids,
+        tail_ids,
+        bias_strength=5.0,
+        min_steps_before_cleav=3,
+        min_steps_after_cleav=3,
+        verbose=False,
+    ):
+        super().__init__()
+        # Ensure we have long tensors for indexing
+        self.register_buffer(
+            "cleavable_idx", torch.tensor(list(cleavable_ids), dtype=torch.long)
+        )
+        self.register_buffer("tail_idx", torch.tensor(list(tail_ids), dtype=torch.long))
+        self.bias = bias_strength
+        self.verbose = verbose
+        self.min_steps_before_cleav = min_steps_before_cleav
+        self.min_steps_after_cleav = min_steps_after_cleav
+
+    def forward(self, logits, motif_status, step_count):
+        # logits shape: (Batch, 1, Vocab)
+        # motif_status shape: (Batch, 3) [Head, Cleav, Tail]
+
+        # 1. Create a zero-filled bias mask of shape (Batch, Vocab)
+        # We match the device and dtype of the input logits
+        bias_mask = torch.zeros(
+            logits.size(0), logits.size(2), device=logits.device, dtype=logits.dtype
+        )
+
+        # 2. Determine boolean conditions
+        has_head = motif_status[:, 0]
+        has_cleav = motif_status[:, 1]
+        has_tail = motif_status[:, 2]
+
+        # Logic: If Head exists but No Cleavable -> Boost Cleavable
+        wait_for_cleav = step_count.squeeze() > self.min_steps_before_cleav
+        boost_cleav = has_head & (~has_cleav) & wait_for_cleav
+
+        # Logic: If Cleavable exists but No Tail -> Boost Tail
+        min_tail_step = self.min_steps_before_cleav + self.min_steps_after_cleav
+        wait_for_tail = step_count.squeeze() > min_tail_step
+        boost_tail = has_cleav & (~has_tail) & wait_for_tail
+
+        if self.verbose and boost_cleav.any():
+            rows = torch.where(boost_cleav)[0]
+
+            # 1. Get the max logit (the token the model WANTS to pick)
+            # logits is (Batch, 1, Vocab), squeeze to (Batch, Vocab)
+            current_logits = logits[rows, 0, :]
+            max_val, max_idx = torch.max(current_logits, dim=-1)
+
+            # 2. Get the logit of the token we represent (just picking the first cleavable_id to test)
+            target_idx = self.cleavable_idx[0]
+            target_val = current_logits[:, target_idx]
+
+            print(f"\n--- DEBUG BIAS CHECK ---")
+            print(f"Attempting to boost {len(rows)} rows.")
+            print(f"Row {rows[0].item()}:")
+            print(
+                f"  > Model's favorite logit: {max_val[0].item():.4f} (ID: {max_idx[0].item()})"
+            )
+            print(
+                f"  > Our target logit:       {target_val[0].item():.4f} (ID: {target_idx.item()})"
+            )
+            print(f"  > Bias Strength:          +{self.bias}")
+            print(f"  > Result after bias:      {target_val[0].item() + self.bias:.4f}")
+
+            if (target_val[0].item() + self.bias) < max_val[0].item():
+                print(f"  > WARNING: Bias is TOO WEAK. The original winner still wins.")
+            else:
+                print(f"  > SUCCESS: Bias should flip the decision.")
+            print(f"------------------------\n")
+
+        # 3. Apply Bias to Mask
+        # "rows" gives us the batch indices that need boosting
+        if boost_cleav.any():
+            rows = torch.where(boost_cleav)[0]
+            # Advanced Indexing: [Rows, Column_Indices] = Bias
+            # We use broadcasting to apply bias to all cleavable_ids for the selected rows
+            bias_mask[rows[:, None], self.cleavable_idx] = self.bias
+
+            if self.verbose:
+                print(f"DEBUG: Boosting Cleavables for {len(rows)} sequences")
+
+        if boost_tail.any():
+            rows = torch.where(boost_tail)[0]
+            bias_mask[rows[:, None], self.tail_idx] = self.bias
+
+            if self.verbose:
+                print(f"DEBUG: Boosting Tails for {len(rows)} sequences")
+
+        # 4. Add Mask to Original Logits
+        # logits is (Batch, 1, Vocab), bias_mask is (Batch, Vocab)
+        # We unsqueeze mask to (Batch, 1, Vocab) to match dimensions
+        return logits + bias_mask.unsqueeze(1)
+
+
 class SmilesGeneratorEnv(EnvBase):
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.envs.EnvBase.html
     # https://docs.pytorch.org/rl/0.8/reference/generated/torchrl.data.CompositeSpec.html
@@ -529,8 +579,9 @@ class SmilesGeneratorEnv(EnvBase):
         num_layers,
         hidden_dim,
         tokenizer,
-        # NEW: Pass the generator so we can prime the state
         generator_model,
+        tags_to_smiles,
+        reward_motifs=None,
         device="cuda",
         seed=None,
         condition_count=5,
@@ -546,9 +597,12 @@ class SmilesGeneratorEnv(EnvBase):
         self.current_step = 0
         self.episode_count = 0
         self.generated_sequence = []
-
-        # Save model for state priming
         self.gen_model = generator_model
+        self.tags_to_smiles = tags_to_smiles
+        self.head_ids = set()
+        self.cleavable_ids = set()
+        self.tail_ids = set()
+        self.head_tags = []
 
         self.head_ids = set()
         self.cleavable_ids = set()
@@ -559,6 +613,8 @@ class SmilesGeneratorEnv(EnvBase):
             for tag, name in tokenizer.motif_map.items():
                 if tag in tokenizer.smiles_map:
                     idx = tokenizer.smiles_map[tag]
+
+                    # Populate the sets based on the category name
                     if "HEAD" in name:
                         self.head_ids.add(idx)
                         self.head_tags.append(tag)
@@ -566,6 +622,34 @@ class SmilesGeneratorEnv(EnvBase):
                         self.cleavable_ids.add(idx)
                     elif "TAIL" in name:
                         self.tail_ids.add(idx)
+
+        # print(f"--- ENV DEBUG ---")
+        # print(f"Head IDs found: {self.head_ids}")
+        # print(f"Cleavable IDs found: {self.cleavable_ids}")
+        # print(f"Tail IDs found: {self.tail_ids}")
+
+        # Verify we actually found them
+        if len(self.head_ids) == 0:
+            print("WARNING: No Head IDs found in Environment! Bias will fail.")
+
+        # compile the reward patterns from our rewards motif dict
+        # this is what we will use to produce structural rewards for good linkers
+        self.reward_patterns = {"heads": [], "cleavable": [], "tails": []}
+        if reward_motifs:
+            for category in self.reward_patterns.keys():
+                for smi in reward_motifs[category]:
+                    mol = Chem.MolFromSmiles(smi)
+                    if mol:
+                        self.reward_patterns[category].append(mol)
+
+        # get all of our head tags from the adc motifs dict
+        # these have our dummy atom labels
+        # during prompting we will periodically start with a valid head
+        self.head_tags = []
+        if hasattr(tokenizer, "motif_map"):
+            for tag, name in tokenizer.motif_map.items():
+                if tag in tokenizer.smiles_map and "HEAD" in name:
+                    self.head_tags.append(tag)
 
         self.observation_spec = CompositeSpec(
             {
@@ -583,9 +667,17 @@ class SmilesGeneratorEnv(EnvBase):
                 "target": DiscreteTensorSpec(
                     n=self.condition_count, shape=(1,), dtype=torch.long
                 ),
+                # keeps track of if we have generated the necessary motifs
+                "motif_status": DiscreteTensorSpec(
+                    n=2, shape=(3,), dtype=torch.bool, device=self.device
+                ),
+                "step_count": UnboundedContinuousTensorSpec(
+                    shape=(1,), dtype=torch.long, device=self.device
+                ),
             }
         )
 
+        # honestly no clue why we need this, got an error message saying it was required for torchRL
         if seed is None:
             seed = torch.empty((), dtype=torch.int64).random_().item()
         self.set_seed(seed)
@@ -601,25 +693,19 @@ class SmilesGeneratorEnv(EnvBase):
         self.current_step = 0
         self.generated_sequence = []
 
-        # 1. Randomize Conditions
+        # randomize the ab, pay and target conditions on reset
         ab_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
         pay_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
         tar_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
 
-        # 2. Decide on Prompting
-        use_prompt = torch.rand(1).item() < 0.8
+        # determine whether we will prompt a head token
+        use_prompt = torch.rand(1).item() < 0.95
 
-        # 3. Calculate Initial Hidden State
-        # We MUST run the 'START' token through the model to get the correct
-        # context for the prompt. Otherwise the model thinks [1Po] is the start.
-
-        # Feed START
+        # Feed START token
         start_input = torch.tensor([[self.token.start_token]], device=self.device)
 
-        # Ensure model is in eval mode for this quick check (no grads needed here)
-        # We act as the "Environment" setting up the board
         with torch.no_grad():
-            _, h_prime, c_prime = self.gen_model(
+            _, h, c = self.gen_model(
                 sequence=start_input,
                 antibody=ab_idx.unsqueeze(0),  # Model expects batch dim
                 payload=pay_idx.unsqueeze(0),
@@ -627,8 +713,8 @@ class SmilesGeneratorEnv(EnvBase):
             )
             # Remove batch dim from hidden states for TensorDict
             # Model returns (Layers, Batch, Dim), we need (Layers, Dim) for spec
-            h_prime = h_prime.squeeze(0)
-            c_prime = c_prime.squeeze(0)
+            h = h.squeeze(0)
+            c = c.squeeze(0)
 
         if use_prompt and len(self.head_tags) > 0:
             prompt_tag = random.choice(self.head_tags)
@@ -638,13 +724,11 @@ class SmilesGeneratorEnv(EnvBase):
             self.generated_sequence = [prompt_id]
             self.current_step = 1
 
-            # The Agent sees the PROMPT, and the HIDDEN STATE derived from START
-            # This perfectly mimics the training sequence: START -> [1Po] -> [Agent decides next]
             start_token = torch.tensor([prompt_id], device=self.device)
-            hidden_state = h_prime
-            cell_state = c_prime
+            hidden_state = h
+            cell_state = c
         else:
-            # Standard start: Agent sees START, and ZERO hidden state
+            # Standard start without the prompt injection
             start_token = torch.tensor(
                 [self.token.start_token], device=self.device, dtype=torch.long
             )
@@ -655,54 +739,74 @@ class SmilesGeneratorEnv(EnvBase):
                 self.num_layers, self.hidden_dim, device=self.device
             )
 
+        # get the motif status for logit biasing
+        token_val = start_token.item()
+        status = torch.tensor(
+            [
+                token_val in self.head_ids,
+                token_val in self.cleavable_ids,
+                token_val in self.tail_ids,
+            ],
+            device=self.device,
+            dtype=torch.bool,
+        )
+
         return TensorDict(
             {
                 "observation": start_token,
                 "hidden": hidden_state,
                 "cell": cell_state,
                 "antibody": ab_idx,
+                "motif_status": status,
+                "step_count": torch.tensor(
+                    [self.current_step], device=self.device, dtype=torch.long
+                ),
                 "payload": pay_idx,
                 "target": tar_idx,
                 "done": torch.tensor([False], device=self.device),
                 "terminated": torch.tensor([False], device=self.device),
-            }
+            },
+            batch_size=[],
         )
 
-    def calculate_structural_reward(self, sequence_list):
+    def calculate_structural_reward(self, mol):
         reward = 0.0
 
-        # Count specific occurrences
-        head_count = 0
-        cleavable_count = 0
-        tail_count = 0
+        has_head = False
+        has_cleavable = False
+        has_tail = False
 
-        for token in sequence_list:
-            if hasattr(token, "item"):
-                token = token.item()
+        for pattern in self.reward_patterns["heads"]:
+            if mol.HasSubstructMatch(pattern):
+                has_head = True
+                break
 
-            if token in self.head_ids:
-                head_count += 1
-            elif token in self.cleavable_ids:
-                cleavable_count += 1
-            elif token in self.tail_ids:
-                tail_count += 1
+        for pattern in self.reward_patterns["cleavable"]:
+            if mol.HasSubstructMatch(pattern):
+                has_cleavable = True
+                break
+
+        for pattern in self.reward_patterns["tails"]:
+            if mol.HasSubstructMatch(pattern):
+                has_tail = True
+                break
 
         # Do you have at least one of these?
-        if head_count >= 1:
+        if has_head:
+            reward += 1.0
+        if has_cleavable:
+            reward += 1.0
+        if has_tail:
+            reward += 1.0
+
+        # Did we get a combination?
+        if has_head and has_cleavable:
             reward += 5.0
-        if cleavable_count >= 1:
-            reward += 5.0
-        if tail_count >= 1:
+        if has_tail and has_cleavable:
             reward += 5.0
 
-        if head_count >= 1 and cleavable_count >= 1:
-            reward += 10.0
-
-        if head_count >= 1 and cleavable_count >= 1 and tail_count >= 1:
-            if head_count == 1 and cleavable_count == 1 and tail_count == 1:
-                reward += 50.0  # Perfection
-            else:
-                reward += 25.0  # Good but has duplicates
+        if has_head and has_cleavable and has_tail:
+            reward += 20.0
 
         return reward
 
@@ -711,18 +815,28 @@ class SmilesGeneratorEnv(EnvBase):
         self.generated_sequence.append(action_token.item())
         self.current_step += 1
 
+        # progressive length penalty
+        step_penalty = 0.0
+        if self.current_step > 30:
+            step_penalty = 0.1
+        if self.current_step > 50:
+            step_penalty = 0.5
+
+        # if we are getting lots of repeats terminate generation
+        # apply small penalty
         repetition_penalty = 0.0
         force_terminate = False
-        if len(self.generated_sequence) >= 5:
-            last_five = self.generated_sequence[-5:]
+        if len(self.generated_sequence) >= 15:
+            last_five = self.generated_sequence[-10:]
             if len(set(last_five)) == 1:
-                repetition_penalty = 1.0
+                repetition_penalty = 0.25
                 force_terminate = True
 
         token_id = action_token.item()
+        is_tail = token_id in self.tail_ids
         is_end = token_id == self.token.end_token
         is_max = self.current_step >= self.max_length
-        done = is_end | is_max | force_terminate
+        done = is_end | is_max | force_terminate | is_tail
 
         ab_idx = tensordict["antibody"]
         pay_idx = tensordict["payload"]
@@ -730,33 +844,106 @@ class SmilesGeneratorEnv(EnvBase):
         next_hidden = tensordict["hidden"]
         next_cell = tensordict["cell"]
 
+        prev_status = tensordict["motif_status"]
+        token_val = action_token.item()
+
+        new_head = prev_status[0] | (token_val in self.head_ids)
+        new_cleav = prev_status[1] | (token_val in self.cleavable_ids)
+        new_tail = prev_status[2] | (token_val in self.tail_ids)
+
+        current_status = torch.tensor(
+            [new_head, new_cleav, new_tail], device=self.device, dtype=torch.bool
+        )
+
+        # reward = -(repetition_penalty + step_penalty)
         reward = -repetition_penalty
 
         if done:
             self.episode_count += 1
+
+            # print(f"DEBUG FINISHED SEQ IDs: {self.generated_sequence}")
+
+            # --- START DEBUG MODIFICATION ---
+            # 1. Convert sequence to a standard python list for checking
+            # if torch.is_tensor(self.generated_sequence):
+            #     seq_list = self.generated_sequence.cpu().tolist()
+            # else:
+            #     seq_list = self.generated_sequence
+
+            # # 2. Check if any of our target IDs are in this finished sequence
+            # # self.cleavable_ids should be available since you use it for motif_status earlier
+            # found_cleavables = [t for t in seq_list if t in self.cleavable_ids]
+            # found_tails = [t for t in seq_list if t in self.tail_ids]
+
+            # if len(found_cleavables) > 0 or len(found_tails) > 0:
+            #     print(f"\n★ SUCCESS (Ep {self.episode_count}) ★")
+
+            #     if len(found_cleavables) > 0:
+            #         # DECODE: What actually is this ID?
+            #         decoded_c = [
+            #             self.token.tokens_to_smiles([t]) for t in found_cleavables
+            #         ]
+            #         print(f"  -> Found Cleavable IDs: {found_cleavables}")
+            #         print(
+            #             f"  -> Verified Translation: {decoded_c}"
+            #         )  # e.g., ['Val-Cit-PAB']
+
+            #     if len(found_tails) > 0:
+            #         # DECODE: What actually is this ID?
+            #         decoded_t = [self.token.tokens_to_smiles([t]) for t in found_tails]
+            #         print(f"  -> Found Tail IDs:      {found_tails}")
+            #         print(f"  -> Verified Translation: {decoded_t}")  # e.g., ['OH']
+
+            #     print(f"  -> Full Sequence IDs: {seq_list}")
+            #     print("--------------------------------------------------\n")
+            # --- END DEBUG MODIFICATION ---
+
             smiles_string = self.token.tokens_to_smiles(self.generated_sequence)
+
+            for tag, smiles in tag_to_smiles.items():
+                smiles_string = smiles_string.replace(tag, smiles)
+
             mol = Chem.MolFromSmiles(smiles_string)
 
-            if force_terminate:
-                total_reward = -1.0
-            elif mol is None:
-                struct_bonus = self.calculate_structural_reward(self.generated_sequence)
-                # Invalid? Small penalty (-1), but keep bonus to encourage motifs
-                total_reward = -1.0 + (struct_bonus * 0.1)
+            if mol is None:
+                total_reward = -0.5
             else:
-                # Valid? Baseline (+1) + Bonus
-                total_reward = 1.0
-                struct_bonus = self.calculate_structural_reward(self.generated_sequence)
-                total_reward += struct_bonus * 0.5
+                # baseline reward for valid smiles is +1.0
+                total_reward = 2.0
+                struct_bonus = self.calculate_structural_reward(mol)
+                total_reward += struct_bonus * 0.3  # reward for adc motifs
+
+                # if the final valid molecule is huge cut the score in half
+                if mol.GetNumAtoms() > 60:
+                    total_reward = total_reward * 0.5
+
+                # convert the sequence to a tensor to pass into scoring model
+                device = self.device
+                full_sequence = torch.tensor(
+                    self.generated_sequence, device=device
+                ).unsqueeze(0)
+
+                # rewarder needs to the sequence to be in the tensordict format, assign to observation
+                score_input = TensorDict(
+                    {"observation": full_sequence}, batch_size=[1], device=device
+                )
+
+                with torch.no_grad():
+                    self.rewarder(score_input)
+
+                score_reward = score_input["reward"].item()
+                total_reward += score_reward * 0.1  # smaller reward here
 
             reward += total_reward
 
-            if self.episode_count % 100 == 0:
-                struct_debug = self.calculate_structural_reward(self.generated_sequence)
+            if (self.episode_count % 100 == 0) and (mol != None):
+                struct_reward_info = self.calculate_structural_reward(mol)
+                print()
                 print(f"--- Ep {self.episode_count} ---")
                 print(f"SMILES: {smiles_string}")
-                print(f"Reward: {reward:.2f} (Struct: {struct_debug})")
+                print(f"Reward: {reward:.2f} (Struct Reward: {struct_reward_info})")
                 print("-----------------------------")
+                print()
 
         return TensorDict(
             {
@@ -769,7 +956,12 @@ class SmilesGeneratorEnv(EnvBase):
                 "target": tar_idx,
                 "hidden": next_hidden,
                 "cell": next_cell,
-            }
+                "motif_status": current_status,
+                "step_count": torch.tensor(
+                    [self.current_step], device=self.device, dtype=torch.long
+                ),
+            },
+            batch_size=[],
         )
 
 
@@ -1126,16 +1318,20 @@ def LSTM_model_RL(
     gen_model,
     critic_model,
     tokenizer,
+    reward_motifs,
+    tags_to_smiles,
     learning_rate=0.00001,
-    temperature=0.7,
+    temperature=1.0,
     total_frames=500_000,
     num_envs=64,
     frame_steps=150,
     clip_epsilon=0.025,
     kl=0.05,
+    bias_strength=5.0,
 ):
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.modules.tensordict_module.ProbabilisticActor.html
     # creating a dict for our LSTM generative model that the actor can then understand for RL
+    # similar tensor dicts are used for passing around data for RL
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -1149,6 +1345,27 @@ def LSTM_model_RL(
     gen_model.to(device)
     critic_model.to(device)
 
+    # load in cleavables and tails from tokenizer
+    # this is necessary for the logit biasing
+    cleav_ids_set = set()
+    tail_ids_set = set()
+
+    if hasattr(tokenizer, "motif_map"):
+        for tag, name in tokenizer.motif_map.items():
+            if tag in tokenizer.smiles_map:
+                idx = tokenizer.smiles_map[tag]
+                # Note: Tag names are uppercase "CLEAVABLE_0", "TAILS_0"
+                if "CLEAVABLE" in name:
+                    cleav_ids_set.add(idx)
+                elif "TAIL" in name:
+                    tail_ids_set.add(idx)
+
+    # print(f"DEBUG: Found {len(cleav_ids_set)} Cleavable Token IDs")
+    # print(f"DEBUG: Found {len(tail_ids_set)} Tail Token IDs")
+
+    if len(cleav_ids_set) == 0:
+        print("WARNING: Bias Module will do nothing because Cleavable Set is empty!")
+
     # actor is our generative model, critic is our scoring model
     # loss module uses the proximal policy optimization (PPO) from torchRL to calculate loss
     lstm_module = TensorDictModule(
@@ -1157,13 +1374,22 @@ def LSTM_model_RL(
         out_keys=["logits", "hidden", "cell"],
     )
 
+    # initializing out bias module for introducing logit bias
+    bias_net = LogitBiasModule(cleav_ids_set, tail_ids_set, bias_strength=bias_strength)
+
+    bias_module = TensorDictModule(
+        bias_net,
+        in_keys=["logits", "motif_status", "step_count"],
+        out_keys=["logits"],
+    )
+
     # temp module controls temp scaler for generation, default of 1.0 is too high most often
     temp_module = TensorDictModule(
         lambda x: x / temperature, in_keys=["logits"], out_keys=["logits"]
     )
 
     policy_module = TensorDictSequential(
-        lstm_module, temp_module
+        lstm_module, bias_module, temp_module
     )  # adds temp scaler to lstm logits
 
     # keys are strict here, need to use predefined key names as described by ProbActor class
@@ -1175,6 +1401,7 @@ def LSTM_model_RL(
         return_log_prob=True,
     )
 
+    # define dicts for handling all the scoring model IO
     SA_module = TensorDictModule(
         module=SA_model,
         in_keys=["observation"],
@@ -1205,16 +1432,14 @@ def LSTM_model_RL(
         out_keys=["CSP3_score"],
     )
 
-    # theoretical bounds for all scoring metrics
+    # bounds for all scoring metrics
     SA_min, SA_max = 0.0, 10.0
-    TPSA_min, TPSA_max = 0.0, 700  # not theoretical, just higher than max in dataset
+    TPSA_min, TPSA_max = 0.0, 700  # lower/higher than min/max in dataset
     QED_min, QED_max = 0.0, 1.0
-    LogP_min, LogP_max = (
-        -10.0,
-        15.0,
-    )  # not theoretical, just lower/higher than min/max in dataset
+    LogP_min, LogP_max = -10.0, 15.0  # lower/higher than in dataset
     CSP3_min, CSP3_max = 0.0, 1.0
 
+    # calculates an aggregate score after normalizing
     def aggregate_scores(SA, TPSA, QED, LogP, CSP3):
         SA_norm = (SA - SA_min) / (SA_max - SA_min)
         TPSA_norm = (TPSA - TPSA_min) / (TPSA_max - TPSA_min)
@@ -1222,14 +1447,15 @@ def LSTM_model_RL(
         LogP_norm = (LogP - LogP_min) / (LogP_max - LogP_min)
         CSP3_norm = (CSP3 - CSP3_min) / (CSP3_max - CSP3_min)
 
-        reward_SA = torch.clamp(1 - SA_norm, 0.0, 1.0)
-        reward_TPSA = torch.clamp(1 - TPSA_norm, 0.0, 1.0)
+        reward_SA = torch.clamp(1 - SA_norm, 0.0, 1.0)  # less is better
+        reward_TPSA = torch.clamp(1 - TPSA_norm, 0.0, 1.0)  # less is better
         reward_QED = torch.clamp(QED_norm, 0.0, 1.0)
-        reward_LogP = torch.clamp(1 - LogP_norm, 0.0, 1.0)
+        reward_LogP = torch.clamp(1 - LogP_norm, 0.0, 1.0)  # less is better
         reward_CSP3 = torch.clamp(CSP3_norm, 0.0, 1.0)
 
         return reward_SA + reward_TPSA + reward_QED + reward_LogP + reward_CSP3
 
+    # need to combine scoring tensors into an aggregate module for rewarding
     aggregate_module = TensorDictModule(
         aggregate_scores,
         in_keys=["SA_score", "TPSA_score", "QED_score", "LogP_score", "CSP3_score"],
@@ -1240,20 +1466,13 @@ def LSTM_model_RL(
         SA_module, TPSA_module, QED_module, LogP_module, CSP3_module, aggregate_module
     )
 
-    # critic forward pass
-    # def forward(self, batch_size, sequence, antibody, payload, target, hidden=None, cell=None)
-
     critic_module = ValueOperator(
         module=critic_model,
         in_keys=["hidden"],
     )
 
-    # critic_module = ValueOperator(
-    #     module=critic_model,
-    #     in_keys=["observation", "antibody", "payload", "target", "hidden", "cell"],
-    # )
-
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.collectors.SyncDataCollector.html
+    # creates our environment that handles the reset and step in RL loop
 
     environment_maker = lambda: SmilesGeneratorEnv(
         reward_module,
@@ -1263,14 +1482,14 @@ def LSTM_model_RL(
         hidden_dim=gen_model.hidden_dim,
         tokenizer=tokenizer,
         generator_model=gen_model,
+        reward_motifs=reward_motifs,
+        tags_to_smiles=tags_to_smiles,
     )
-
-    # hyper params for reinforcement learning:
-    # learning_rate = 0.00001
 
     env = SerialEnv(num_envs, environment_maker)
 
     # anchor model to prevent moving too far from starting model
+    # this works with kl_div, it is our baseline that we can fall back on
     ref_model = LSTMGenModel(
         input_dim=128,
         hidden_dim=256,
@@ -1283,7 +1502,7 @@ def LSTM_model_RL(
 
     ref_model.load_state_dict(gen_model.state_dict())
     ref_model.to(device)
-    ref_model.eval()
+    ref_model.eval()  # ensure grads don't update for reference model
 
     for param in ref_model.parameters():
         param.requires_grad = False
@@ -1385,15 +1604,15 @@ def LSTM_model_RL(
             )
 
             # compute the KL loss
+            # prevents updating RL model if change is too great
+            # https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.kl_div.html
             actor_log_probs = F.log_softmax(actor_logits, dim=-1)
             ref_probs = F.softmax(ref_logits, dim=-1)
-
             kl_div = F.kl_div(actor_log_probs, ref_probs, reduction="batchmean")
-
             total_loss = actor_loss + critic_loss + (kl_coeff * kl_div)
 
             if i % 10 == 0:
-                print(f"KL Div: {kl_div.item():.4f} | Act Loss {actor_loss.item():.4f}")
+                print(f"KL Div: {kl_div.item():.4f}")
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -1405,9 +1624,25 @@ def LSTM_model_RL(
         # avg_reward = batch["next", "reward"].mean().item()
         rewards = batch["next", "reward"].sum(dim=1)
         avg_reward = rewards.mean().item()
-        print(
-            f"Batch {i} || Loss: {total_loss.item():.4f}, Avg Reward: {avg_reward:.4f}"
-        )
+
+        # 2. Completed Episode Average (The "Final Exam Score")
+        # We look for steps where done=True. These contain the final validation reward.
+        done_mask = batch["next", "done"].squeeze(-1)
+
+        if done_mask.any():
+            # Extract rewards only from the steps where the episode finished
+            final_rewards = batch["next", "reward"][done_mask]
+            avg_final_reward = final_rewards.mean().item()
+            valid_count = (final_rewards > 0).float().sum()
+            valid_pct = (valid_count / len(final_rewards)) * 100
+
+            print(
+                f"Batch {i} || Avg Reward: {avg_final_reward:.4f} | Valid: {valid_pct:.1f}% | KL: {kl_div.item():.4f}"
+            )
+        else:
+            print(
+                f"Batch {i} || Loss: {total_loss.item():.4f} | Avg Batch Reward: {avg_reward:.4f} (No episodes finished)"
+            )
 
     print("RL training complete.")
 
@@ -1679,7 +1914,8 @@ def check_sequences_conditional(
 
 
 def generate_valid_linkers(
-    adc_motifs,
+    reward_motifs,  # <--- NEW: The FULL dictionary (for validation)
+    adc_motifs,  # <--- OLD: The SAFE dictionary (for un-tagging)
     SA_model,
     TPSA_model,
     QED_model,
@@ -1703,98 +1939,113 @@ def generate_valid_linkers(
     for model in [SA_model, TPSA_model, QED_model, LogP_model, CSP3_model, gen_model]:
         model.to(device).eval()
 
-    # --- 1. PREPARE TAG LOOKUPS ---
+    # Convert the strings in reward_motifs to RDKit Mol objects once
+    print("Compiling reward patterns...")
+    reward_patterns = {
+        "heads": [
+            Chem.MolFromSmiles(s)
+            for s in reward_motifs["heads"]
+            if Chem.MolFromSmiles(s)
+        ],
+        "cleavable": [
+            Chem.MolFromSmiles(s)
+            for s in reward_motifs["cleavable"]
+            if Chem.MolFromSmiles(s)
+        ],
+        "tails": [
+            Chem.MolFromSmiles(s)
+            for s in reward_motifs["tails"]
+            if Chem.MolFromSmiles(s)
+        ],
+    }
+
+    # We use adc_motifs (Safe List) to reconstruct the [1Po] -> SMILES map
     tag_to_real = {}
     counter = 1
-    for smiles_list in adc_motifs.values():
-        for s in smiles_list:
-            tag_to_real[f"[{counter}Po]"] = s
-            counter += 1
+    # Iterate in the exact same order as your tagging function
+    for category in ["cleavable", "heads", "tails"]:
+        if category in adc_motifs:
+            for s in adc_motifs[category]:
+                tag_to_real[f"[{counter}Po]"] = s
+                counter += 1
 
-    # Get sets of IDs for checking structure
-    head_ids, cleavable_ids, tail_ids = set(), set(), set()
-    head_tags = []  # We need this list to pick prompts
-
+    # Get Head Tags for Prompting
+    head_tags = []
     if hasattr(tokenizer, "motif_map"):
         for tag, name in tokenizer.motif_map.items():
-            if tag in tokenizer.smiles_map:
-                idx = tokenizer.smiles_map[tag]
-                if "HEAD" in name:
-                    head_ids.add(idx)
-                    head_tags.append(tag)
-                elif "CLEAVABLE" in name:
-                    cleavable_ids.add(idx)
-                elif "TAIL" in name:
-                    tail_ids.add(idx)
+            if tag in tokenizer.smiles_map and "HEAD" in name:
+                head_tags.append(tag)
 
-    # --- 2. HELPER: CONVERT TAGS ---
-    def convert_tags_to_real(tagged_smi):
-        real_smi = tagged_smi
-        for tag, real in tag_to_real.items():
-            real_smi = real_smi.replace(tag, real)
-        return real_smi
+    def check_structure_graph(mol):
+        has_head = False
+        has_cleavable = False
+        has_tail = False
 
-    # --- 3. HELPER: CHECK STRUCTURE ---
-    def check_structure(sequence_list):
-        head_c, cleav_c, tail_c = 0, 0, 0
-        for token in sequence_list:
-            if hasattr(token, "item"):
-                token = token.item()
-            if token in head_ids:
-                head_c += 1
-            elif token in cleavable_ids:
-                cleav_c += 1
-            elif token in tail_ids:
-                tail_c += 1
+        for pat in reward_patterns["heads"]:
+            if mol.HasSubstructMatch(pat):
+                has_head = True
+                break
 
-        # We need exactly 1 of each
-        if head_c == 1 and cleav_c == 1 and tail_c == 1:
-            return True
-        return False
+        if has_head:
+            for pat in reward_patterns["cleavable"]:
+                if mol.HasSubstructMatch(pat):
+                    has_cleavable = True
+                    break
+
+        if has_head and has_cleavable:
+            for pat in reward_patterns["tails"]:
+                if mol.HasSubstructMatch(pat):
+                    has_tail = True
+                    break
+
+        return has_head and has_cleavable and has_tail
 
     print(f"Generating linkers (Target: {target_count})...")
 
     # --- 4. GENERATION LOOP ---
+    SA_scores = []
+
     while (len(valid_linkers) < target_count) and (attempts < max_attempts):
         attempts += 1
 
-        # --- CRITICAL FIX: MANUAL PROMPTING ---
-        # We manually start the generation loop with a random HEAD tag
-        # This mimics the RL environment's behavior.
+        # A. Prompting (Manual Priming)
+        # We assume head_tags has entries. If not, fallback to START.
+        if head_tags:
+            prompt_tag = random.choice(head_tags)
+            prompt_id = tokenizer.smiles_map[prompt_tag]
 
-        prompt_tag = random.choice(head_tags)
-        prompt_id = tokenizer.smiles_map[prompt_tag]
+            # Feed START
+            start_input = torch.tensor([[tokenizer.start_token]], device=device)
+            ab_t = torch.tensor([[ab_idx]], device=device)
+            pay_t = torch.tensor([[pay_idx]], device=device)
+            tar_t = torch.tensor([[tar_idx]], device=device)
 
-        # We need to manually "prime" the model with START -> PROMPT
-        # Note: We can't use generate_smiles_conditional directly because it starts with START
-        # So we create a slightly modified call logic here:
+            with torch.no_grad():
+                _, hidden, cell = gen_model(start_input, ab_t, pay_t, tar_t)
 
-        # A. Feed START to get hidden state
-        start_input = torch.tensor([[tokenizer.start_token]], device=device)
-        ab_t = torch.tensor([[ab_idx]], device=device)
-        pay_t = torch.tensor([[pay_idx]], device=device)
-        tar_t = torch.tensor([[tar_idx]], device=device)
+            # Start loop with Prompt
+            current_token = torch.tensor([[prompt_id]], device=device)
+            sequence = [prompt_id]
+        else:
+            # Fallback (Shouldn't happen if setup is correct)
+            current_token = torch.tensor([[tokenizer.start_token]], device=device)
+            sequence = []  # Start token isn't part of sequence usually
+            hidden, cell = None, None
+            ab_t = torch.tensor([[ab_idx]], device=device)
+            pay_t = torch.tensor([[pay_idx]], device=device)
+            tar_t = torch.tensor([[tar_idx]], device=device)
 
-        with torch.no_grad():
-            _, hidden, cell = gen_model(start_input, ab_t, pay_t, tar_t)
-
-        # B. Feed PROMPT (The Head) to start the real generation
-        current_token = torch.tensor([[prompt_id]], device=device)
-        sequence = [prompt_id]  # Start list with our prompt
-
-        # C. Run Generation Loop
-        for _ in range(100):  # max length
+        # B. Run Generation
+        for _ in range(100):
             with torch.no_grad():
                 out, hidden, cell = gen_model(
                     current_token, ab_t, pay_t, tar_t, hidden, cell
                 )
 
-                # Sampling
                 logits = out[:, -1, :]
                 logits[0, tokenizer.start_token] = -1e9
                 logits[0, tokenizer.pad_token] = -1e9
 
-                # Apply Temperature
                 probs = F.softmax(logits / temperature, dim=-1)
                 next_token = torch.multinomial(probs, 1).item()
 
@@ -1804,30 +2055,44 @@ def generate_valid_linkers(
                 sequence.append(next_token)
                 current_token = torch.tensor([[next_token]], device=device)
 
-        # --- END GENERATION ---
+        tagged_smiles = tokenizer.tokens_to_smiles(sequence)
 
-        # 5. VALIDATE
-        if check_structure(sequence):
-            tagged_smiles = tokenizer.tokens_to_smiles(sequence)
+        real_smiles = tagged_smiles
+        for tag, smi in tag_to_real.items():
+            real_smiles = real_smiles.replace(tag, smi)
 
-            if Chem.MolFromSmiles(tagged_smiles):
-                real_smiles = convert_tags_to_real(tagged_smiles)
+        # 2. Create Mol
+        mol = Chem.MolFromSmiles(real_smiles)
+
+        if mol is not None:
+            # 3. Check Structure (Graph Match)
+            if check_structure_graph(mol):
                 valid_linkers.append(real_smiles)
+                print(f"  [FOUND!] {real_smiles[:40]}...")
 
-                # Print success to confirm it's working
-                print(f"  [FOUND!] {tagged_smiles}")
+                # Score it
+                seq_tensor = torch.tensor(sequence, device=device).unsqueeze(0)
+                with torch.no_grad():
+                    SA_scores.append(SA_model(seq_tensor).cpu().numpy())
+                    # ... add other scores if you want ...
             else:
-                failures["invalid"] += 1
+                failures["structure"] += 1
         else:
-            failures["structure"] += 1
-            # Debug: Print what it generated so we know why it failed
-            if attempts % 100 == 0:
-                print(f"  [Fail Struct] {tokenizer.tokens_to_smiles(sequence)}")
+            failures["invalid"] += 1
 
-    # Reporting...
+        if attempts % 50 == 0:
+            print(
+                f"  ...Attempt {attempts}: Found {len(valid_linkers)} (Failures: Struct={failures['structure']}, Invalid={failures['invalid']})"
+            )
+
+    # --- 5. REPORTING ---
     print("-" * 30)
     print(f"Total Attempts: {attempts}")
-    print(f"Found: {len(valid_linkers)}")
+    print(f"Valid Structures Found: {len(valid_linkers)}")
+    if len(SA_scores) > 0:
+        print(f"Avg SA = {np.mean(SA_scores):.4f}")
+    print("-" * 30)
+
     return valid_linkers
 
 
@@ -1856,6 +2121,7 @@ def canonicalize_motifs(motif_dict):
     return clean_dict
 
 
+# REMOVE LATER
 def verify_model_vocabulary_corrected(gen_model, tokenizer, motif_dict=None):
     print("\n--- VOCABULARY SANITY CHECK (TAGGED VERSION) ---")
     gen_model.eval()
@@ -1950,6 +2216,7 @@ def calculate_class_weights(dataset, tokenizer, device):
     return weight_tensor
 
 
+# REMOVE LATER
 def inspect_dataset_tokenization(dataset, tokenizer, num_samples=5):
     print(f"\n--- INSPECTING DATASET TOKENIZATION (N={num_samples}) ---")
 
@@ -2008,35 +2275,34 @@ def inspect_dataset_tokenization(dataset, tokenizer, num_samples=5):
 
 # crucial need to keep
 def tag_dataset_with_motifs(df, motif_dict):
-    print("Tagging dataset with Graph-Based Replacements...")
+    print("Tagging dataset with ADC motif replacements")
 
-    # 1. Build a Lookup: Pattern Molecule -> Replacement Tag
-    # We use Polonium [Po] with isotopes 1, 2, 3... as unique IDs
     replacements = []
     counter = 1
-
-    # Keep track of what ID maps to what name for the tokenizer later
     tag_map = {}
 
-    for category, smiles_list in motif_dict.items():
-        for i, smi in enumerate(smiles_list):
+    for category in ["cleavable", "heads", "tails"]:
+        if category not in motif_dict:
+            continue
+
+        for i, smi in enumerate(motif_dict[category]):
             pattern = Chem.MolFromSmiles(smi)
             if pattern is None:
                 continue
 
-            # Create a dummy atom with a specific isotope
-            # e.g., [1Po], [2Po], [3Po]...
+            # Replace with a dummy atom that would never be used
             tag_smiles = f"[{counter}Po]"
             replacement = Chem.MolFromSmiles(tag_smiles)
-
             token_name = f"<{category.upper()}_{i}>"
 
-            # Store tuple: (Pattern, Replacement, Name, TagString)
             replacements.append((pattern, replacement, token_name, tag_smiles))
             tag_map[tag_smiles] = token_name
             counter += 1
 
-    # 2. Define the row processor
+    # Sort replacements by size
+    # Ensures we capture all the big stuff before the small stuff
+    replacements.sort(key=lambda x: x[0].GetNumAtoms(), reverse=True)
+
     def process_row(smi):
         if not smi:
             return ""
@@ -2044,38 +2310,42 @@ def tag_dataset_with_motifs(df, motif_dict):
         if not mol:
             return ""
 
-        # Try to replace every motif we know
-        # We sort by number of atoms in pattern (descending) to match largest motifs first
-        # (This prevents a small fragment match inside a larger one)
-        sorted_replacements = sorted(
-            replacements, key=lambda x: x[0].GetNumAtoms(), reverse=True
-        )
-
-        for pat, rep, name, tag in sorted_replacements:
+        for pat, rep, name, tag in replacements:
             if mol.HasSubstructMatch(pat):
                 try:
-                    # Replace ALL instances of this motif
-                    mol = AllChem.ReplaceSubstructs(mol, pat, rep, replaceAll=True)[0]
+                    test_mol = AllChem.ReplaceSubstructs(
+                        mol, pat, rep, replaceAll=True
+                    )[0]
+
+                    # check for valence errors
+                    Chem.SanitizeMol(test_mol)
+
+                    # if we have a broken bond then default to regular smile not motif dummy
+                    if "." not in Chem.MolToSmiles(test_mol):
+                        mol = test_mol
+                    else:
+                        # if it failed then skip the conversion
+                        pass
                 except:
-                    # Sometimes replacement fails if valences are weird, skip
+                    # sometimes rdkit is giving me errors...
                     pass
 
         try:
-            # Return the new SMILES (now containing [1Po], [2Po] etc)
             return Chem.MolToSmiles(mol, canonical=True)
         except:
             return ""
 
-    # 3. Apply to DataFrame
+    # add the tagged smiles to their own column
     df["tagged_smiles"] = df["smiles"].apply(process_row)
 
-    # Filter out failures
+    # Filter out empty strings
     df = df[df["tagged_smiles"] != ""]
 
-    print("Tagging Complete.")
+    print(f"Tagging Complete.")
     return df, tag_map
 
 
+# REMOVE LATER
 def check_motif_usage_in_generation(gen_model, tokenizer, num_samples=10):
     print(f"\n--- GENERATING {num_samples} SAMPLES TO CHECK MOTIF USAGE ---")
     gen_model.eval()
@@ -2116,6 +2386,7 @@ def check_motif_usage_in_generation(gen_model, tokenizer, num_samples=10):
     )
 
 
+# REMOVE LATER
 def test_prompted_generation(gen_model, tokenizer):
     print("\n--- PROMPTED GENERATION TEST ---")
     gen_model.eval()
@@ -2188,6 +2459,7 @@ def test_prompted_generation(gen_model, tokenizer):
 
 
 def generate_robust_static_vocab(tag_map):
+
     # 1. Standard Atoms (Hardcoded)
     # These are the atoms RDKit might generate
     standard_tokens = set(
@@ -2266,65 +2538,440 @@ def generate_robust_static_vocab(tag_map):
     return final_vocab
 
 
+def build_tag_to_smiles_map(motif_dict):
+    tag_to_smiles = {}
+    counter = 1
+
+    for category in ["cleavable", "heads", "tails"]:
+        for smi in motif_dict[category]:
+            tag = f"[{counter}Po]"
+            tag_to_smiles[tag] = smi
+            counter += 1
+
+    return tag_to_smiles
+
+
+def setup_bias(tokenizer, bias_strength=15.0):
+    head_ids = set()
+    cleavable_ids = set()
+    tail_ids = set()
+
+    # get all of our motifs
+    for tag, name in tokenizer.motif_map.items():
+        if tag in tokenizer.smiles_map:
+            idx = tokenizer.smiles_map[tag]
+
+            if "HEAD" in name:
+                head_ids.add(idx)
+            elif "CLEAVABLE" in name:
+                cleavable_ids.add(idx)
+            elif "TAIL" in name:
+                tail_ids.add(idx)
+
+    # instantiate the bias module
+    bias_module = LogitBiasModule(
+        cleavable_ids=cleavable_ids,
+        tail_ids=tail_ids,
+        bias_strength=bias_strength,
+        min_steps_before_cleav=3,  # Ensure spacing
+        min_steps_after_cleav=3,
+        verbose=False,  # Keep it quiet during generation
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    bias_module.to(device)
+
+    return bias_module, head_ids, cleavable_ids, tail_ids
+
+
+def generate_biased_sequence(
+    gen_model,
+    bias_module,
+    tokenizer,
+    id_sets,  # (head_ids, cleav_ids, tail_ids) from setup function
+    ab_idx,
+    pay_idx,
+    tar_idx,
+    temperature=1.0,
+    max_len=100,
+    use_prompt=True,
+):
+
+    # this is basically the same loop for applying bias as in our RL loop
+    device = next(gen_model.parameters()).device
+    head_ids, cleav_ids, tail_ids = id_sets
+
+    # initialize the state tracking for bias module
+    motif_status = torch.tensor(
+        [[False, False, False]], device=device, dtype=torch.bool
+    )
+    step_count = torch.tensor([0], device=device, dtype=torch.long)
+
+    # set the conditional seeds for generation
+    current_token = torch.tensor([[tokenizer.start_token]], device=device)
+    ab_t = torch.tensor([[ab_idx]], device=device)
+    pay_t = torch.tensor([[pay_idx]], device=device)
+    tar_t = torch.tensor([[tar_idx]], device=device)
+
+    hidden, cell = None, None
+    sequence = []
+
+    gen_model.eval()
+
+    start_input = torch.tensor([[tokenizer.start_token]], device=device)
+
+    with torch.no_grad():
+        # Prime the model with START input
+        _, hidden, cell = gen_model(
+            start_input, ab_t, pay_t, tar_t, hidden_state=hidden, cell_state=cell
+        )
+
+        if use_prompt and len(head_ids) > 0:
+            # pick random head to start
+            prompt_id = random.choice(list(head_ids))
+
+            # set head as the current token
+            current_token = torch.tensor([[prompt_id]], device=device)
+
+            # update the trackers for generation
+            sequence.append(prompt_id)
+            motif_status[0, 0] = True  # We now have a head
+            step_count += 1
+        else:
+            # else if no prompt scenario
+            current_token = start_input
+
+    # 3. Generation Loop
+    with torch.no_grad():
+        for i in range(max_len):
+
+            # get the raw output
+            output, hidden, cell = gen_model(
+                current_token, ab_t, pay_t, tar_t, hidden_state=hidden, cell_state=cell
+            )
+
+            # apply the bias strength modifier
+            if bias_module is not None:
+                output = bias_module(output, motif_status, step_count)
+
+            # grab the next token
+            logits = output[:, -1, :]
+
+            # mask the pad and start tokens like usual
+            logits[0, tokenizer.start_token] = -1e9
+            logits[0, tokenizer.pad_token] = -1e9
+
+            # temp and sample application
+            probs = F.softmax(logits / temperature, dim=-1)
+            next_token = torch.multinomial(probs, 1).item()
+
+            if next_token == tokenizer.end_token:
+                break
+
+            # update the internal state of the module
+            sequence.append(next_token)
+            current_token = torch.tensor([[next_token]], device=device)
+            step_count += 1
+
+            # check if the next picked token is one of our desired motifs
+            is_head = next_token in head_ids
+            is_cleav = next_token in cleav_ids
+            is_tail = next_token in tail_ids
+
+            # update motif status tracker if we found them
+            if is_head:
+                motif_status[0, 0] = True
+            if is_cleav:
+                motif_status[0, 1] = True
+            if is_tail:
+                motif_status[0, 2] = True
+
+            # stop generating once we reach a tail
+            if is_tail:
+                break
+
+    # did we get all three motifs
+    success = motif_status[0].all().item()
+
+    return sequence, success
+
+
+def generation_loop(
+    model,
+    tokenizer,
+    tag_to_smiles,
+    SA_model,
+    TPSA_model,
+    QED_model,
+    LogP_model,
+    CSP3_model,
+    ab,
+    pay,
+    tar,
+    bias_strength=15.0,
+    temp=0.8,
+    target_count=10,
+):
+
+    # initialize our bias module
+    device = next(model.parameters()).device
+    bias_net, h_ids, c_ids, t_ids = setup_bias(tokenizer, bias_strength=bias_strength)
+
+    scorers = [SA_model, TPSA_model, QED_model, LogP_model, CSP3_model]
+    for scorer in scorers:
+        scorer.to(device)
+        scorer.eval()
+
+    # start generating
+    print("Generating Valid Linkers with Bias...")
+
+    fixes = {
+        # Heads (Fixing Exit Points)
+        "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",  # Azide (Critical Fix)
+        "CCBr": "BrCC",  # Bromoethyl
+        "O=CCBr": "BrCC=O",  # Bromoacetyl
+        "CC#C": "C#CC",  # Alkyne
+        # Cleavables (Fixing Branching)
+        "Oc1ccc(N=Nc2ccccc2)cc1": "Oc1ccc(cc1)N=Nc2ccccc2",  # Linear Azo
+        "Nc1ccc(CO)cc1": "Nc1ccc(cc1)CO",  # Linear PABC
+    }
+
+    valid_linkers = []
+    attempts = 0
+    max_attempts = target_count * 1000
+
+    while len(valid_linkers) < target_count and attempts < max_attempts:
+        attempts += 1
+        print(f"Attemps: {attempts}/{max_attempts}", end="\r")
+        seq, success = generate_biased_sequence(
+            gen_model=model,  # Use your RL trained model
+            bias_module=bias_net,
+            tokenizer=tokenizer,
+            id_sets=(h_ids, c_ids, t_ids),
+            ab_idx=ab,
+            pay_idx=pay,
+            tar_idx=tar,  # Change conditions as needed
+            temperature=temp,  # Lower temp slightly for stability
+        )
+
+        if success:
+            tagged_smi = tokenizer.tokens_to_smiles(seq)
+            real_smi = tagged_smi
+            for tag, structure in tag_to_smiles.items():
+
+                if tag in real_smi:
+                    structure_to_use = fixes.get(structure, structure)
+                    real_smi = real_smi.replace(tag, structure_to_use)
+
+            if Chem.MolFromSmiles(real_smi) is not None:
+                # Basic deduplication
+                if real_smi not in valid_linkers:
+                    print(f"Gen {len(valid_linkers)+1}:")
+                    # valid_linkers.append(real_smi)
+
+                    # generate all of our scores for valid smiles
+                    seq_tensor = torch.tensor(seq, device=device).unsqueeze(0)
+                    with torch.no_grad():
+                        sa_val = SA_model(seq_tensor).item()
+                        tpsa_val = TPSA_model(seq_tensor).item()
+                        qed_val = QED_model(seq_tensor).item()
+                        logp_val = LogP_model(seq_tensor).item()
+                        csp3_val = CSP3_model(seq_tensor).item()
+
+                    results_entry = {
+                        "SMILES": real_smi,
+                        "SA": sa_val,
+                        "TPSA": tpsa_val,
+                        "QED": qed_val,
+                        "LogP": logp_val,
+                        "CSP3": csp3_val,
+                    }
+
+                    valid_linkers.append(results_entry)
+            else:
+                # print("Failed validity check")
+                pass
+
+    if attempts >= max_attempts:
+        print("Warning: Hit max attempts limit.")
+    return valid_linkers
+
+
+def visualize_molecule_clusters(
+    model,
+    dataset,
+    tokenizer,
+    itos_dicts,
+    num_samples=1000,
+    color_by="antibody",  # Options: "antibody", "payload", "indication"
+):
+    """
+    Runs data through the model to capture the LSTM's internal "Thought Vector"
+    (Hidden State) for each molecule, then projects it to 2D using UMAP.
+    """
+    print(f"--- GENERATING UMAP CLUSTERS (Color by: {color_by}) ---")
+    model.eval()
+    device = next(model.parameters()).device
+
+    # Create a loader to handle padding/collating efficiently
+    loader = DataLoader(
+        dataset, batch_size=32, shuffle=True, collate_fn=tokenizer.collate_smiles
+    )
+
+    vectors = []
+    labels = []
+
+    map_idx = 0
+    if color_by == "payload":
+        map_idx = 1
+    elif color_by == "indication":
+        map_idx = 2
+
+    current_map = itos_dicts[map_idx]
+
+    count = 0
+    with torch.no_grad():
+        for i, (smile, ab, pay, tar, score) in enumerate(loader):
+            if count >= num_samples:
+                break
+
+            # Move to device
+            smile = smile.to(device)
+            ab = ab.to(device)
+            pay = pay.to(device)
+            tar = tar.to(device)
+
+            # manually run the embedding step
+            emb_seq = model.token_embedding(smile)
+
+            # Expand conditions to match sequence length
+            seq_len = smile.size(1)
+            emb_ab = model.ab_embedding(ab).expand(-1, seq_len, -1)
+            emb_pay = model.pay_embedding(pay).expand(-1, seq_len, -1)
+            emb_tar = model.target_embedding(tar).expand(-1, seq_len, -1)
+
+            # Concatenate
+            lstm_input = torch.cat([emb_seq, emb_ab, emb_pay, emb_tar], dim=-1)
+
+            out, (h, c) = model.lstm(lstm_input)
+
+            # extract the last state vector
+            last_hidden = out[:, -1, :].cpu().numpy()
+
+            vectors.extend(last_hidden)
+
+            # capture the labels for legend in plot
+            if color_by == "antibody":
+                ids = ab.cpu().numpy().flatten()
+            elif color_by == "payload":
+                ids = pay.cpu().numpy().flatten()
+            else:
+                ids = tar.cpu().numpy().flatten()
+
+            for cid in ids:
+                name = current_map.get(cid, "Unknown")
+                labels.append(name)
+
+            count += len(smile)
+            print(f"Processed {count}/{num_samples} molecules...", end="\r")
+
+    print("\nRunning UMAP dimensionality reduction... (This may take a moment)")
+
+    # 5. UMAP Projection
+    reducer = umap.UMAP(n_neighbors=50, min_dist=0.1, metric="cosine", random_state=42)
+    embedding = reducer.fit_transform(vectors)
+
+    # 6. Plotting
+    df = pd.DataFrame(embedding, columns=["x", "y"])
+    df["Condition"] = labels[: len(df)]
+
+    plt.figure(figsize=(14, 10))
+    sns.scatterplot(
+        data=df,
+        x="x",
+        y="y",
+        hue="Condition",
+        style="Condition",
+        palette="tab10",  # High contrast palette
+        s=80,
+        alpha=0.8,
+    )
+
+    plt.title(f"Molecule Latent Space conditioned by {color_by.title()}", fontsize=18)
+    plt.legend(loc="upper left", fontsize=14.0)
+    plt.tight_layout()
+    plt.show()
+
+
 if __name__ == "__main__":
+    reward_motifs = {
+        "cleavable": [
+            "Nc1ccc(cc1)CO",  # PABC Core (Benzene)
+            "SS",  # Disulfide Bond
+            "CC(C)[C@@H]C=O",  # Valine Backbone
+            "CCC(=O)NNC=O",  # Hydrazone
+            "CC[C@@H]C=O",  # Alanine
+            "OC(=O)[C@@H](CCC)C=O",  # Glutamic acid derivative
+            "Oc1ccc(cc1)N=Nc2ccccc2",  # Azo-linker
+            "Nc1ccc(cc1)CO",
+            "O=[N+]([O-])c1ccccc1",  # Nitro-aromatic
+            "NC(=O)[C@@H](CCCC)C=O",  # Citrulline/Glutamine sidechain
+            "N[C@@H](C(C)C)C(=O)",  # Valine derivative
+            "N[C@@H](CCC(=O)O)C(=O)",  # Glutamic acid
+            "N[C@@H](CCCCN)C(=O)",
+            "NC(=O)[C@@H](CCCC)C(=O)",  # Lysine/Ornithine
+        ],
+        "heads": [
+            # --- Standard Conjugation ---
+            "O=C1C=CC(=O)N1",  # Maleimide
+            "O=C1CCC(=O)N1O",  # NHS Ester
+            "O=C1CC(S(=O)(=O)O)C(=O)N1O",  # Sulfo-NHS
+            "CCBr",  # Bromoethyl
+            "O=CCBr",  # Bromoacetyl
+            "O=C1N[C@@H]2[C@H](S1)NC2",  # Biotin (Core ring structure)
+            "CCC(=O)NN",  # Hydrazide
+            "O=Cc1ccccc1",  # Benzaldehyde
+            "CCN=[N+]=[N-]",  # Azide
+            "CC#C",  # Alkyne
+            "C#Cc1ccccc1",  # DBCO fragment (simplified)
+            "C1=CCCC=CC1",  # TCO (Cyclooctene core)
+            "Cc1nnc[nH]1",  # Tetrazine/Triazine core
+            "C#CC1CC2CC1C2",  # BCN Core
+            "C#CC1CCCCC1",  # Cyclooctyne variant
+            "Fc1c(F)c(F)c(F)c(F)F",  # PFP (Pentafluorobenzene)
+            "Fc1cc(F)c(F)c1F",  # TFP
+            "O=[N+]([O-])c1ccccc1",  # Nitrophenyl
+            "O=[N+]([O-])c1cc([N+](=O)[O-])ccc1",  # Dinitrophenyl
+            "Cc1ccc(S(=O)(=O)O)cc1",  # Tosylate
+            "CS(=O)(=O)O",  # Mesylate
+        ],
+        "tails": [
+            "c1ccccc1",  # Phenyl
+            "CC(=O)S",  # Thioacetate
+            "CC1c2ccccc2-c2ccccc21",  # Fluorenyl
+            "c1ccncc1",  # Pyridine
+            "CCS(=O)(=O)O",  # Sulfonate
+            "CC(=O)CCC=O",  # Levulinyl
+        ],
+    }
     adc_motifs = {
         "cleavable": [
-            "c1ccccc1",
             "SS",
-            "CC(C)[C@@H]C=O",
             "CCC(=O)NNC=O",
-            "CC[C@@H]C=O",
-            "OC(=O)[C@@H](CCC)C=O",
-            "Oc1ccc(N=Nc2ccccc2)cc1",
-            "O=[N+]([O-])c1ccccc1",
-            "NC(=O)[C@@H](CCCC)C=O",
-            "CC(C)CC=O",
-            "OC(=O)[C@@H](CCC=O)CC=O",
-            "OC(=O)[C@@H](CCCC)C=O",
+            "N[C@@H](C(C)C)C(=O)",
+            "Nc1ccc(cc1)CO",
+            "Oc1ccc(cc1)N=Nc2ccccc2",
+            "N[C@@H](CCC(=O)O)C(=O)" "N[C@@H](CCCCN)C(=O)",
+            "NC(=O)[C@@H](CCCC)C(=O)",
         ],
         "heads": [
             "O=C1C=CC(=O)N1",
-            "O=C1CCC(=O)N1O",
-            "O=C1CC(S(=O)(=O)O)C(=O)N1O",
-            "CCBr",
-            "O=CCBr",
-            "O=C1N[C@@H]2[C@H](S1)NC2",
-            "CCC(=O)NN",
-            "O=Cc1ccccc1",
             "CCN=[N+]=[N-]",
             "CC#C",
-            "C#Cc1ccccc1",
-            "C1=CCCC=CC1",
-            "Cc1nnc[nH]1",
-            "C#CC1CC2CC1C2",
-            "C#CC1CCCCC1",
-            "Fc1c(F)c(F)c(F)c(F)F",
-            "Fc1cc(F)c(F)c1F",
-            "O=[N+]([O-])c1ccccc1",
-            "O=[N+]([O-])c1cc([N+](=O)[O-])ccc1",
-            "Cc1ccc(S(=O)(=O)O)cc1",
-            "CS(=O)(=O)O",
         ],
         "tails": [
-            "CCC(=O)O",
-            "CC(=O)O",
-            "CCN",
-            "CN",
-            "c1ccccc1",
-            "CCS",
-            "CC(=O)S",
-            "CO",
-            "CC(C)(C)C",
-            "CC1c2ccccc2-c2ccccc21",
-            "CCO",
-            "CO",
-            "CC",
+            "CC1c2ccccc2-c2ccccc21",  # Fmoc
             "c1ccncc1",
-            "NC=O",
-            "CCS(=O)(=O)O",
-            "CO",
-            "CC=O",
-            "CC(=O)CCC=O",
         ],
     }
 
@@ -2346,24 +2993,124 @@ if __name__ == "__main__":
     # Clean Motifs
     adc_motifs_clean = canonicalize_motifs(adc_motifs)
 
-    # Clean Dataframe Strings
-    def strict_canonicalize(smi):
-        if not smi:
-            return ""
-        mol = Chem.MolFromSmiles(smi)
-        if mol:
-            return Chem.MolToSmiles(mol, canonical=True)
-        return ""
-
-    combo_df["smiles"] = combo_df["smiles"].apply(strict_canonicalize)
+    # check for any empty smiles
     combo_df = combo_df[combo_df["smiles"] != ""]
 
-    # Apply Graph Tags
-    combo_df, tag_map = tag_dataset_with_motifs(combo_df, adc_motifs_clean)
+    # aka the grease trap
+    def is_boring_linker(smi):
+        if "CCCCCC" in smi:
+            return True
+        if "COCCOCCO" in smi:
+            return True
+        if "OCCOCCOC" in smi:
+            return True
 
-    # Init Tokenizer
+        # if more than 70% is just carbon and oxygen then its boring
+        c_count = smi.count("C") + smi.count("c")
+        o_count = smi.count("O") + smi.count("o")
+        if len(smi) > 20 and (c_count + o_count) / len(smi) > 0.8:
+            return True
+
+        return False
+
+    boring_mask = combo_df["smiles"].apply(is_boring_linker)
+    boring_df = combo_df[boring_mask]
+    interesting_df = combo_df[~boring_mask]
+
+    boring_sample = boring_df.sample(frac=0.05)
+    combo_df = pd.concat([boring_sample, interesting_df])
+
+    # Apply Graph Tags
+    # This replace complex motifs with our dummy atoms
+    combo_df, tag_map = tag_dataset_with_motifs(combo_df, adc_motifs_clean)
+    tag_to_smiles = build_tag_to_smiles_map(adc_motifs_clean)
+
+    # ran into a weird issue where the linear azo was getting pulled to make the tag map
+    # need to manually swap it so generation doesn't get branched azo
+
+    # azo_branched = "Oc1ccc(N=Nc2ccccc2)cc1"
+    # azo_linear = "Oc1ccc(cc1)N=Nc2ccccc2"
+    # azo_tag = None
+
+    # some of the motifs have trouble getting reattached and need to be flipped
+    fixes = {
+        "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",
+        "CCBr": "BrCC",
+        "O=CCBr": "BrCC=O",
+        "CC#C": "C#CC",
+        "Oc1ccc(N=Nc2ccccc2)cc1": "Oc1ccc(cc1)N=Nc2ccccc2",
+        "Nc1ccc(CO)cc1": "Nc1ccc(cc1)CO",
+    }
+
+    patches_applied = 0
+
+    # update the tag_to_smiles dict
+    for tag, smi in tag_to_smiles.items():
+        if smi in fixes:
+            old_smi = smi
+            new_smi = fixes[smi]
+            tag_to_smiles[tag] = new_smi
+            patches_applied += 1
+
     tokenizer = Tokenizer(combo_df, tag_map=tag_map)
     stoi_dicts, itos_dicts, dict_lengths = conditions_tokens(combo_df)
+
+    reward_patterns = {
+        "heads": [
+            Chem.MolFromSmiles(s)
+            for s in reward_motifs["heads"]
+            if Chem.MolFromSmiles(s)
+        ],
+        "cleavable": [
+            Chem.MolFromSmiles(s)
+            for s in reward_motifs["cleavable"]
+            if Chem.MolFromSmiles(s)
+        ],
+        "tails": [
+            Chem.MolFromSmiles(s)
+            for s in reward_motifs["tails"]
+            if Chem.MolFromSmiles(s)
+        ],
+    }
+
+    def perfect_linkers(smi):
+        # same as our calculate struct reward inside env class
+        if not smi:
+            return False
+        mol = Chem.MolFromSmiles(smi)
+        if not mol:
+            return False
+
+        has_head = False
+        has_cleavable = False
+        has_tail = False
+
+        for pat in reward_patterns["heads"]:
+            if mol.HasSubstructMatch(pat):
+                has_head = True
+                break
+
+        if has_head:
+            for pat in reward_patterns["cleavable"]:
+                if mol.HasSubstructMatch(pat):
+                    has_cleavable = True
+                    break
+
+        if has_head and has_cleavable:
+            for pat in reward_patterns["tails"]:
+                if mol.HasSubstructMatch(pat):
+                    has_tail = True
+                    break
+
+        # perfect linker
+        return has_head and has_cleavable and has_tail
+
+    # filter for perfect linkers and remove boring results
+    perfect_mask = combo_df["tagged_smiles"].apply(perfect_linkers)
+    perfect_df = combo_df[perfect_mask].copy()
+    perfect_df["data_type"] = "real"  # not really but trust
+
+    # generate_robust_static_vocab(tag_map=tag_map)
 
     # Create Datasets
     synth_dataset = adcDataset(
@@ -2373,6 +3120,8 @@ if __name__ == "__main__":
         augment=False,
         source_type="synthetic",
     )
+
+    # previously tried having smiles augmentation but it confused model
     easy_dataset = adcDataset(
         df=combo_df,
         tokenizer=tokenizer,
@@ -2381,7 +3130,16 @@ if __name__ == "__main__":
         source_type="real",
     )
 
+    perfect_dataset = adcDataset(
+        df=perfect_df,
+        tokenizer=tokenizer,
+        stoi_dicts=stoi_dicts,
+        augment=False,
+        source_type="real",
+    )
+
     # # --- 2. TRAIN SCORING MODELS ---
+    # print()
     # print("--- Training Scoring Models ---")
     # training_scores = ["SA", "TPSA", "QED", "LogP", "CSP3"]
     # for score in training_scores:
@@ -2391,8 +3149,8 @@ if __name__ == "__main__":
     #     torch.save(model.state_dict(), f"models/{score}_scores_weights.pth")
 
     # # # --- 3. TRAIN GENERATOR (The Sandwich Method) ---
+    # print()
     # print("--- Training Generative Model ---")
-
     # gen_model = LSTMGenModel(
     #     input_dim=128,
     #     hidden_dim=256,
@@ -2439,8 +3197,8 @@ if __name__ == "__main__":
     #     use_weighted_loss=False,
     # )
 
-    # # Phase D: Final Polish (Real Data, Low LR)
-    # print("Phase D: Final Polish (Real Data)...")
+    # # Phase D: Polish on real data (Real Data, Low LR)
+    # print("Phase D: Polish on real data...")
     # gen_model = train_LSTM_gen(
     #     model=gen_model,
     #     dataset=easy_dataset,
@@ -2450,6 +3208,23 @@ if __name__ == "__main__":
     #     use_weighted_loss=False,
     # )
     # torch.save(gen_model.state_dict(), "models/model_gen_weights_final.pth")
+
+    # # Phase E: Polish on perfect linker data
+    # print("Phase E: Polish on perfect linker data...")
+
+    # gen_model.load_state_dict(
+    #     torch.load("models/model_gen_weights_final.pth", weights_only=True)
+    # )
+
+    # gen_model = train_LSTM_gen(
+    #     model=gen_model,
+    #     dataset=perfect_dataset,
+    #     tokenizer=tokenizer,
+    #     learning_rate=0.0001,
+    #     num_epochs=20,
+    #     use_weighted_loss=False,
+    # )
+    # torch.save(gen_model.state_dict(), "models/model_gen_weights_perfect.pth")
 
     # --- 4. REINFORCEMENT LEARNING ---
     print("--- Starting Reinforcement Learning ---")
@@ -2505,49 +3280,89 @@ if __name__ == "__main__":
 
     # Load Generator (Final Weights)
     gen_model.load_state_dict(
-        torch.load("models/model_gen_weights_final.pth", weights_only=True)
+        torch.load("models/model_gen_weights_perfect.pth", weights_only=True)
     )
 
     # need to tune these params
-    RL_trained_model = LSTM_model_RL(
-        SA_model,
-        TPSA_model,
-        QED_model,
-        LogP_model,
-        CSP3_model,
-        gen_model,
-        critic_model,
-        tokenizer,
-        learning_rate=0.00001,
-        temperature=0.7,
-        total_frames=500_000,
-        num_envs=64,
-        frame_steps=150,
-        clip_epsilon=0.025,
-        kl=0.05,
-    )
-
-    torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
-
-    # gen_model.load_state_dict(
-    #     torch.load("models/model_RL_gen_weights.pth", weights_only=True)
-    # )
-
-    # linkers = generate_valid_linkers(
-    #     adc_motifs,
+    # RL_trained_model = LSTM_model_RL(
     #     SA_model,
     #     TPSA_model,
     #     QED_model,
     #     LogP_model,
     #     CSP3_model,
     #     gen_model,
+    #     critic_model,
     #     tokenizer,
-    #     ab_idx=1,
-    #     pay_idx=2,
-    #     tar_idx=1,
-    #     target_count=1,
-    #     max_attempts=1000,
-    #     temperature=1.0,
+    #     reward_motifs=reward_motifs,
+    #     tags_to_smiles=tag_to_smiles,
+    #     learning_rate=0.0001,  # .00005
+    #     temperature=0.7,  # 1.0
+    #     total_frames=500_000,
+    #     num_envs=32,
+    #     frame_steps=150,
+    #     clip_epsilon=0.1,  # .1
+    #     kl=0.0005,  # .05
+    #     bias_strength=20.0,  # 15.0
     # )
 
-    # print(linkers)
+    # torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
+
+    gen_model.load_state_dict(
+        torch.load("models/model_RL_gen_weights.pth", weights_only=True)
+    )
+
+    ab = 2
+    pay = 2
+    tar = 2
+
+    linkers = generation_loop(
+        model=gen_model,
+        tokenizer=tokenizer,
+        tag_to_smiles=tag_to_smiles,
+        SA_model=SA_model,
+        TPSA_model=TPSA_model,
+        QED_model=QED_model,
+        LogP_model=LogP_model,
+        CSP3_model=CSP3_model,
+        ab=ab,
+        pay=pay,
+        tar=tar,
+        bias_strength=20.0,
+        temp=0.7,
+        target_count=5,
+    )
+
+    print("------ Linker Report -------")
+    print()
+    print(f"Antibody: {itos_dicts[0][ab]}")
+    print(f"Payload: {itos_dicts[1][pay]}")
+    print(f"Cancer Target: {itos_dicts[2][tar]}")
+    print()
+    for i, result in enumerate(linkers):
+        print(f"------- Linker {i+1} ----------")
+        print(f"SMILE: {result['SMILES']}")
+        print(f"SA: {result['SA']:.4f}")
+        print(f"TPSA: {result['TPSA']:.4f}")
+        print(f"QED: {result['QED']:.4f}")
+        print(f"LogP: {result['LogP']:.4f}")
+        print(f"CSSP3: {result['CSP3']:.4f}")
+        print("---------------------------")
+
+    # gen_model.to("cuda" if torch.cuda.is_available() else "cpu")
+
+    # viz_dataset = adcDataset(
+    #     df=combo_df,  # or perfect_df
+    #     tokenizer=tokenizer,
+    #     stoi_dicts=stoi_dicts,
+    #     augment=False,
+    #     source_type="real",
+    # )
+
+    # visualize_molecule_clusters(
+    #     model=gen_model,
+    #     dataset=viz_dataset,
+    #     tokenizer=tokenizer,
+    #     itos_dicts=itos_dicts,
+    #     num_samples=2000,  # More points = denser clouds
+    #     color_by="indication",  # <--- Change this to what you want to check
+    # )
