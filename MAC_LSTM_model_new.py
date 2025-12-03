@@ -41,6 +41,10 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 # Disable error messages when a non-valid smiles is encountered
 rdBase.DisableLog("rdApp.error")
 
