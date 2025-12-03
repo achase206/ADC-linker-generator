@@ -88,7 +88,20 @@ class Tokenizer:
             "[",
             "[10Po]",
             "[11Po]",
+            "[12Po]",
+            "[13Po]",
+            "[14Po]",
+            "[15Po]",
+            "[16Po]",
+            "[17Po]",
+            "[18Po]",
+            "[19Po]",
             "[1Po]",
+            "[20Po]",
+            "[21Po]",
+            "[22Po]",
+            "[23Po]",
+            "[24Po]",
             "[2Po]",
             "[3Po]",
             "[4Po]",
@@ -198,6 +211,7 @@ class LSTMScoreModel(nn.Module):
         super(LSTMScoreModel, self).__init__()
         self.hidden_dim = hidden_dim
         self.layer_dim = layer_dim
+        self.tokenizer = tokenizer
         self.embedding = nn.Embedding(
             num_embeddings=tokenizer.vocab_size,
             embedding_dim=input_dim,
@@ -212,9 +226,13 @@ class LSTMScoreModel(nn.Module):
     def forward(self, x, hidden=None, cell=None):
         embedded_seq = self.embedding(x)
 
+        # dont't include padding tokens for calculation
+        mask = (x != self.tokenizer.pad_token).float().unsqueeze(-1)
+
+        embedded_seq = self.embedding(x)
+
         # for RL we need the hidden and cell state
         # didn't need it for initial training on entire sequence
-
         if hidden is not None and cell is not None:
 
             # Torch RL passes in batch, num_layers, hidden_dim
@@ -229,8 +247,14 @@ class LSTMScoreModel(nn.Module):
         else:
             out, _ = self.lstm(embedded_seq)
 
-        out = out[:, -1, :]  # Take last time step
-        out = self.dropout(out)  # apply dropout even when layer_dim = 1
+        out = out * mask
+
+        # sum of hidden states / num tokens in sequence
+        out_sum = out.sum(dim=1)
+        out_count = mask.sum(dim=1).clamp(min=1e-9)  # prevent div zero
+        pooled_out = out_sum / out_count
+
+        out = self.dropout(pooled_out)
         out = self.fc(out)  # final layer
 
         return out
@@ -699,7 +723,7 @@ class SmilesGeneratorEnv(EnvBase):
         tar_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
 
         # determine whether we will prompt a head token
-        use_prompt = torch.rand(1).item() < 0.95
+        use_prompt = torch.rand(1).item() < 1.0
 
         # Feed START token
         start_input = torch.tensor([[self.token.start_token]], device=self.device)
@@ -1094,7 +1118,9 @@ def kfolds_LSTM_scores(directory):
     print(f"RMSE Validation Loss: {rmse:.4f}")
 
 
-def train_LSTM_scores(dataset, tokenizer, score_type, num_epochs=100):
+def train_LSTM_scores(
+    dataset, tokenizer, score_type, num_epochs=100, learning_rate=0.00005
+):
     """
     Training loop for LSTM scoring metrics
     Used later on as critics for RL
@@ -1124,7 +1150,7 @@ def train_LSTM_scores(dataset, tokenizer, score_type, num_epochs=100):
     print(f"Training {score_type} score on device {device}")
 
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     for epoch in range(num_epochs):
         for i, (smile, ab, pay, target, score) in enumerate(loader):
@@ -2726,14 +2752,14 @@ def generation_loop(
     print("Generating Valid Linkers with Bias...")
 
     fixes = {
-        # Heads (Fixing Exit Points)
-        "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",  # Azide (Critical Fix)
-        "CCBr": "BrCC",  # Bromoethyl
-        "O=CCBr": "BrCC=O",  # Bromoacetyl
-        "CC#C": "C#CC",  # Alkyne
-        # Cleavables (Fixing Branching)
-        "Oc1ccc(N=Nc2ccccc2)cc1": "Oc1ccc(cc1)N=Nc2ccccc2",  # Linear Azo
-        "Nc1ccc(CO)cc1": "Nc1ccc(cc1)CO",  # Linear PABC
+        "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",
+        "CCBr": "BrCC",
+        "BrCC=O": "BrCC(=O)",
+        "O=CCBr": "BrCC=O",
+        "CC#C": "C#CC",
+        "Oc1ccc(N=Nc2ccccc2)cc1": "Oc1ccc(cc1)N=Nc2ccccc2",
+        "Nc1ccc(CO)cc1": "Nc1ccc(cc1)CO",
+        "CC1c2ccccc2-c2ccccc21": "C(=O)OCC1c2ccccc2-c2ccccc21",
     }
 
     valid_linkers = []
@@ -2773,10 +2799,15 @@ def generation_loop(
                     seq_tensor = torch.tensor(seq, device=device).unsqueeze(0)
                     with torch.no_grad():
                         sa_val = SA_model(seq_tensor).item()
-                        tpsa_val = TPSA_model(seq_tensor).item()
-                        qed_val = QED_model(seq_tensor).item()
+                        raw_tpsa = TPSA_model(seq_tensor).item()
+                        raw_qed = QED_model(seq_tensor).item()
                         logp_val = LogP_model(seq_tensor).item()
-                        csp3_val = CSP3_model(seq_tensor).item()
+                        raw_csp3 = CSP3_model(seq_tensor).item()
+
+                        # apply clamping / bounds
+                        qed_val = max(0.0, min(1.0, raw_qed))
+                        csp3_val = max(0.0, min(1.0, raw_csp3))
+                        tpsa_val = max(0.0, raw_tpsa)
 
                     results_entry = {
                         "SMILES": real_smi,
@@ -2944,14 +2975,26 @@ if __name__ == "__main__":
             "O=[N+]([O-])c1cc([N+](=O)[O-])ccc1",  # Dinitrophenyl
             "Cc1ccc(S(=O)(=O)O)cc1",  # Tosylate
             "CS(=O)(=O)O",  # Mesylate
+            "O=C1CCC(=O)N1OC(=O)",  # NHS Ester (N-hydroxysuccinimide)
+            "O=C1CC(S(=O)(=O)[O-])C(=O)N1OC(=O)",  # Sulfo-NHS Ester (Water soluble)
+            "Fc1c(F)c(F)c(F)c(F)c1OC(=O)",  # PFP Ester (Pentafluorophenyl)
+            "Fc1c(F)cc(F)c(F)c1OC(=O)",
+            "BrCC(=O)",  # Bromoacetyl
+            "ICC(=O)",
+            "C1CC2CCC1C2COC(=O)",
+            "C1/C=C\CCCCC1OC(=O)",
+            "O=C(Cn1nccc1)",
         ],
         "tails": [
             "c1ccccc1",  # Phenyl
             "CC(=O)S",  # Thioacetate
-            "CC1c2ccccc2-c2ccccc21",  # Fluorenyl
+            "C(=O)OCC1c2ccccc2-c2ccccc21",  # Fluorenyl
             "c1ccncc1",  # Pyridine
             "CCS(=O)(=O)O",  # Sulfonate
             "CC(=O)CCC=O",  # Levulinyl
+            "C(=O)OC(C)(C)C",  # Boc (tert-Butyloxycarbonyl) - Acid labile
+            "C(=O)OCc1ccccc1",  # Cbz (Carboxybenzyl) - Z-group
+            "C(=O)C(F)(F)F",
         ],
     }
     adc_motifs = {
@@ -2968,10 +3011,22 @@ if __name__ == "__main__":
             "O=C1C=CC(=O)N1",
             "CCN=[N+]=[N-]",
             "CC#C",
+            "O=C1CCC(=O)N1OC(=O)",  # NHS Ester (N-hydroxysuccinimide)
+            "O=C1CC(S(=O)(=O)[O-])C(=O)N1OC(=O)",  # Sulfo-NHS Ester (Water soluble)
+            "Fc1c(F)c(F)c(F)c(F)c1OC(=O)",  # PFP Ester (Pentafluorophenyl)
+            "Fc1c(F)cc(F)c(F)c1OC(=O)",
+            "BrCC(=O)",  # Bromoacetyl
+            "ICC(=O)",
+            "C1CC2CCC1C2COC(=O)",
+            "C1/C=C\CCCCC1OC(=O)",
+            "O=C(Cn1nccc1)",
         ],
         "tails": [
             "CC1c2ccccc2-c2ccccc21",  # Fmoc
             "c1ccncc1",
+            "C(=O)OC(C)(C)C",  # Boc (tert-Butyloxycarbonyl) - Acid labile
+            "C(=O)OCc1ccccc1",  # Cbz (Carboxybenzyl) - Z-group
+            "C(=O)C(F)(F)F",
         ],
     }
 
@@ -3025,21 +3080,16 @@ if __name__ == "__main__":
     combo_df, tag_map = tag_dataset_with_motifs(combo_df, adc_motifs_clean)
     tag_to_smiles = build_tag_to_smiles_map(adc_motifs_clean)
 
-    # ran into a weird issue where the linear azo was getting pulled to make the tag map
-    # need to manually swap it so generation doesn't get branched azo
-
-    # azo_branched = "Oc1ccc(N=Nc2ccccc2)cc1"
-    # azo_linear = "Oc1ccc(cc1)N=Nc2ccccc2"
-    # azo_tag = None
-
     # some of the motifs have trouble getting reattached and need to be flipped
     fixes = {
         "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",
         "CCBr": "BrCC",
+        "BrCC=O": "BrCC(=O)",
         "O=CCBr": "BrCC=O",
         "CC#C": "C#CC",
         "Oc1ccc(N=Nc2ccccc2)cc1": "Oc1ccc(cc1)N=Nc2ccccc2",
         "Nc1ccc(CO)cc1": "Nc1ccc(cc1)CO",
+        "CC1c2ccccc2-c2ccccc21": "C(=O)OCC1c2ccccc2-c2ccccc21",
     }
 
     patches_applied = 0
@@ -3144,7 +3194,11 @@ if __name__ == "__main__":
     # training_scores = ["SA", "TPSA", "QED", "LogP", "CSP3"]
     # for score in training_scores:
     #     model = train_LSTM_scores(
-    #         dataset=easy_dataset, score_type=score, tokenizer=tokenizer, num_epochs=20
+    #         dataset=easy_dataset,
+    #         score_type=score,
+    #         tokenizer=tokenizer,
+    #         num_epochs=50,
+    #         learning_rate=0.00001,
     #     )
     #     torch.save(model.state_dict(), f"models/{score}_scores_weights.pth")
 
@@ -3295,14 +3349,14 @@ if __name__ == "__main__":
     #     tokenizer,
     #     reward_motifs=reward_motifs,
     #     tags_to_smiles=tag_to_smiles,
-    #     learning_rate=0.0001,  # .00005
+    #     learning_rate=0.00005,  # .00005
     #     temperature=0.7,  # 1.0
-    #     total_frames=500_000,
+    #     total_frames=1_000_000,
     #     num_envs=32,
     #     frame_steps=150,
     #     clip_epsilon=0.1,  # .1
     #     kl=0.0005,  # .05
-    #     bias_strength=20.0,  # 15.0
+    #     bias_strength=15.0,  # 15.0
     # )
 
     # torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
