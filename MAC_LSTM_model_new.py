@@ -153,10 +153,12 @@ class Tokenizer:
         self.inv_smiles_map = {v: k for k, v in self.smiles_map.items()}
         self.vocab_size = len(self.smiles_map)
 
+    # Inverse SMILES tokenizer
     def smiles_detokenizer(self):
         inv_smiles_map = {token: pattern for pattern, token in self.smiles_map.items()}
         return inv_smiles_map
 
+    # List of SMILES tokens to list of token IDs
     def smiles_to_tokens(self, smile_pattern_list):
         smiles_tokens = []
         for char in smile_pattern_list:
@@ -168,6 +170,7 @@ class Tokenizer:
         smiles_tokens.append(self.smiles_map["END"])
         return smiles_tokens
 
+    # List of token IDs to SMILES string
     def tokens_to_smiles(self, smile_token_list):
         smiles_patterns = []
         for token in smile_token_list:
@@ -183,6 +186,7 @@ class Tokenizer:
         # smiles_patterns = [self.inv_smiles_map[token] for token in smile_token_list]
         return "".join(smiles_patterns)
 
+    # Collate function for DataLoader
     def collate_smiles(self, batch):
 
         smiles_list, ab_list, pay_list, target_list, scores = zip(*batch)
@@ -198,7 +202,7 @@ class Tokenizer:
 
         return smiles_padded, ab_stack, pay_stack, target_stack, scores_stack
 
-
+# LSTM model for scoring molecules
 class LSTMScoreModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, layer_dim, output_dim, tokenizer):
         super(LSTMScoreModel, self).__init__()
@@ -215,6 +219,7 @@ class LSTMScoreModel(nn.Module):
         # added dropout to reduce overfitting
         self.dropout = nn.Dropout(0.2)
 
+    # Need to adjust forward pass to accept hidden and cell states
     def forward(self, x, hidden=None, cell=None):
         embedded_seq = self.embedding(x)
 
@@ -241,7 +246,7 @@ class LSTMScoreModel(nn.Module):
 
         return out
 
-
+# LSTM model for generating molecules
 class LSTMGenModel(nn.Module):
     def __init__(
         self,
@@ -292,6 +297,7 @@ class LSTMGenModel(nn.Module):
         # added dropout to reduce overfitting
         self.dropout = nn.Dropout(0.2)
 
+    # Forward pass for LSTMGenModel
     def forward(
         self, sequence, antibody, payload, target, hidden_state=None, cell_state=None
     ):
@@ -354,7 +360,8 @@ class LSTMGenModel(nn.Module):
 
         return out, hidden_state, cell_state
 
-
+# Critic model for evaluating current memory state of actors
+# A critic model is used for value estimation in actor-critic methods
 class CriticModel(nn.Module):
     def __init__(self, hidden_dim, output_dim):
         super().__init__()
@@ -375,7 +382,7 @@ class CriticModel(nn.Module):
 
         return value
 
-
+# Dataset class for ADC molecules
 class adcDataset(Dataset):
 
     def __init__(
@@ -467,7 +474,8 @@ class adcDataset(Dataset):
             score,
         )
 
-
+# Logit Biasing Module
+# Used for bias towards completing motifs
 class LogitBiasModule(nn.Module):
     def __init__(
         self,
@@ -489,6 +497,7 @@ class LogitBiasModule(nn.Module):
         self.min_steps_before_cleav = min_steps_before_cleav
         self.min_steps_after_cleav = min_steps_after_cleav
 
+    # Forward pass for LogitBiasModule
     def forward(self, logits, motif_status, step_count):
         # logits shape: (Batch, 1, Vocab)
         # motif_status shape: (Batch, 3) [Head, Cleav, Tail]
@@ -566,7 +575,8 @@ class LogitBiasModule(nn.Module):
         # We unsqueeze mask to (Batch, 1, Vocab) to match dimensions
         return logits + bias_mask.unsqueeze(1)
 
-
+# Environment class for SMILES generation
+# Inherits from EnvBase in torchRL
 class SmilesGeneratorEnv(EnvBase):
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.envs.EnvBase.html
     # https://docs.pytorch.org/rl/0.8/reference/generated/torchrl.data.CompositeSpec.html
@@ -703,6 +713,7 @@ class SmilesGeneratorEnv(EnvBase):
         torch.manual_seed(seed)
         return seed + 1
 
+    # Reset is called at the beginning of each episode
     def _reset(self, tensordict=None):
         self.current_step = 0
         self.generated_sequence = []
@@ -978,7 +989,8 @@ class SmilesGeneratorEnv(EnvBase):
             batch_size=[],
         )
 
-
+# Create condition token mappings
+# Playload, Antibody, Indication
 def conditions_tokens(df):
 
     def conditions_mapping(condition: str, dict_length: int):
@@ -1107,7 +1119,7 @@ def kfolds_LSTM_scores(directory):
     rmse = np.sqrt(mse)
     print(f"RMSE Validation Loss: {rmse:.4f}")
 
-
+# Outputs the trained LSTM model
 def train_LSTM_scores(dataset, tokenizer, score_type, num_epochs=100):
     """
     Training loop for LSTM scoring metrics
