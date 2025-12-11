@@ -1330,15 +1330,17 @@ def LSTM_model_RL(
                     cell_state=inp_cell,
                 )
 
-            # next get the actor logits to compare against
-            actor_logits, _, _ = gen_model(
-                sequence=inp_obs,
-                antibody=inp_ab,
-                payload=inp_pay,
-                target=inp_tar,
-                hidden_state=inp_hidden,
-                cell_state=inp_cell,
-            )
+                ###### BUG ################
+                # indentation error here need to fix, KL not being applied
+                # next get the actor logits to compare against
+                actor_logits, _, _ = gen_model(
+                    sequence=inp_obs,
+                    antibody=inp_ab,
+                    payload=inp_pay,
+                    target=inp_tar,
+                    hidden_state=inp_hidden,
+                    cell_state=inp_cell,
+                )
 
             # compute the KL loss
             # prevents updating RL model if change is too great
@@ -2456,27 +2458,27 @@ if __name__ == "__main__":
     )
 
     # need to tune these params
-    # RL_trained_model = LSTM_model_RL(
-    #     gen_model,
-    #     critic_model,
-    #     tokenizer,
-    #     reward_motifs=reward_motifs,
-    #     tags_to_smiles=tag_to_smiles,
-    #     learning_rate=0.00005,  # .00005
-    #     temperature=0.7,  # 1.0
-    #     total_frames=1_000_000,
-    #     num_envs=32,
-    #     frame_steps=150,
-    #     clip_epsilon=0.1,  # .1
-    #     kl=0.0005,  # .05
-    #     bias_strength=15.0,  # 15.0
-    # )
-
-    # torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
-
-    gen_model.load_state_dict(
-        torch.load("models/model_RL_gen_weights.pth", weights_only=True)
+    RL_trained_model = LSTM_model_RL(
+        gen_model,
+        critic_model,
+        tokenizer,
+        reward_motifs=reward_motifs,
+        tags_to_smiles=tag_to_smiles,
+        learning_rate=0.00005,  # .00005
+        temperature=0.7,  # 1.0
+        total_frames=1_000_000,
+        num_envs=32,
+        frame_steps=150,
+        clip_epsilon=0.1,  # .1
+        kl=0.0005,  # .05
+        bias_strength=15.0,  # 15.0
     )
+
+    torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
+
+    # gen_model.load_state_dict(
+    #     torch.load("models/model_RL_gen_weights.pth", weights_only=True)
+    # )
 
     # ab = 2
     # pay = 2
@@ -2510,7 +2512,7 @@ if __name__ == "__main__":
     #     print(f"CSSP3: {result['CSP3']:.4f}")
     #     print("---------------------------")
 
-    gen_model.to("cuda" if torch.cuda.is_available() else "cpu")
+    # gen_model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     # viz_dataset = adcDataset(
     #     df=combo_df,  # or perfect_df
@@ -2529,23 +2531,23 @@ if __name__ == "__main__":
     #     color_by="indication",
     # )
 
-    real_smiles = adc_df["smiles"]
+    # real_smiles = adc_df["smiles"]
 
-    validity, novelty, unique, sa_avg, qed_avg, logp_avg, sa_std, qed_std, logp_std = (
-        performance_metrics(
-            model=gen_model,
-            real_smiles_series=real_smiles,
-            tokenizer=tokenizer,
-            tag_to_smiles=tag_to_smiles,
-            bias_strength=15.0,
-            temp=0.8,
-            target_count=1000,
-        )
-    )
+    # validity, novelty, unique, sa_avg, qed_avg, logp_avg, sa_std, qed_std, logp_std = (
+    #     performance_metrics(
+    #         model=gen_model,
+    #         real_smiles_series=real_smiles,
+    #         tokenizer=tokenizer,
+    #         tag_to_smiles=tag_to_smiles,
+    #         bias_strength=15.0,
+    #         temp=0.8,
+    #         target_count=1000,
+    #     )
+    # )
 
-    print(f"validity = {validity}")
-    print(f"novelty = {novelty}")
-    print(f"unique = {unique}")
-    print(f"SA Avg = {sa_avg} | std = {sa_std}")
-    print(f"QED AVG = {qed_avg} | std = {qed_std}")
-    print(f"LogP AVG = {logp_avg} | std = {logp_std}")
+    # print(f"validity = {validity}")
+    # print(f"novelty = {novelty}")
+    # print(f"unique = {unique}")
+    # print(f"SA Avg = {sa_avg} | std = {sa_std}")
+    # print(f"QED AVG = {qed_avg} | std = {qed_std}")
+    # print(f"LogP AVG = {logp_avg} | std = {logp_std}")
