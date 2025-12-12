@@ -1,21 +1,30 @@
 import pandas as pd
 import numpy as np
 import torch
+import selfies as sf
 
 from LSTM_classes import (
     Tokenizer,
     LSTMGenModel,
     adcDataset,
 )
-from LSTM_helpers import (
+from LSTM_utils import (
     conditions_tokens,
     canonicalize_motifs,
     tag_dataset_with_motifs,
     build_tag_to_smiles_map,
 )
 
+from LSTM_helpers import (
+    generation_loop,
+    performance_metrics,
+    umap_training_data,
+    umap_generated_data,
+)
+
 if __name__ == "__main__":
 
+    print()
     print("#" * 30)
     print("ADC LINKER GENERATOR")
     print("#" * 30)
@@ -116,6 +125,7 @@ if __name__ == "__main__":
     combo_df = combo_df.loc[valid_indices].reset_index(drop=True)
     combo_df["selfies"] = selfies_list
 
+    # setup our tokenizer and conditional mapping
     tokenizer = Tokenizer(combo_df, tag_map=tag_map)
     stoi_dicts, itos_dicts, dict_lengths = conditions_tokens(combo_df)
 
@@ -142,7 +152,7 @@ if __name__ == "__main__":
     print("1. Generate Linkers\n2. Assess Model Performance\n3. Generate UMAPs")
     while True:
         try:
-            operation = input("Operation: ")
+            operation = int(input("Option: "))
             if operation in valid_operation:
                 break
         except ValueError:
@@ -152,74 +162,64 @@ if __name__ == "__main__":
         valid_operation = [1, 2, 3, 4]
 
         print()
-        print("Select your antibody:")
-        print("1. Cetuximab")
-        print("2. MCLL0517A")
-        print("3. Patritumab")
-        print("4. Lorvotuzumab")
+        print("Select your antibody-combo:")
+        print("1. Cetuximab - Puromycin -Triple negative breast cancer")
+        print("2. MCLL0517A - PBD dimer -  Acute myeloid leukaemia")
+        print("3. Patritumab - ADC-C1 payload  - Breast cancer")
+        print("4. Lorvotuzumab - Rachelmycin - Small cell lung cancer")
         while True:
             try:
-                ab = input("Antibody: ")
-                if ab in valid_operation:
+                combo = int(input("Combo: "))
+                if combo in valid_operation:
                     break
             except ValueError:
-                print("Invalid antibody, try again")
+                print("Invalid combo id, try again")
 
         print()
-        print("Select your payload:")
-        print("1. Puromycin")
-        print("2. PBD dimer")
-        print("3. ADC-C1 payload")
-        print("4. Rachelmycin")
+        print("How many linker candidates? (<10)")
         while True:
             try:
-                pay = input("Payload: ")
-                if pay in valid_operation:
+                linkers = int(input("Num Linkers: "))
+                if isinstance(linkers, int) and linkers <= 10:
                     break
             except ValueError:
-                print("Invalid payload, try again")
+                print("Invalid number of linkers, try again")
 
-        print()
-        print("Select your cancer target:")
-        print("1. Triple negative breast cancer")
-        print("2. Acute myeloid leukaemia")
-        print("3. Breast cancer")
-        print("4. Small cell lung cancer")
-        while True:
-            try:
-                tar = input("Target: ")
-                if tar in valid_operation:
-                    break
-            except ValueError:
-                print("Invalid payload, try again")
+        gen_model = LSTMGenModel(
+            input_dim=128,
+            hidden_dim=256,
+            layer_dim=5,
+            vocab_size=tokenizer.vocab_size,
+            padding_idx=tokenizer.pad_token,
+            output_dim=tokenizer.vocab_size,
+            condition_count=5,
+        )
 
-        print()
-        print("How many linkers to generate?")
-        while True:
-            try:
-                num_linkers = input("Num linkers: ")
-                if isinstance(num_linkers, int):
-                    break
-            except ValueError:
-                print("Invalid number, try again")
+        gen_model.load_state_dict(
+            torch.load(
+                f"{model_directory}/model_RL_gen_weights_v2.pth", weights_only=True
+            )
+        )
 
         linkers = generation_loop(
             model=gen_model,
             tokenizer=tokenizer,
             tag_to_smiles=tag_to_smiles,
-            ab=ab,
-            pay=pay,
-            tar=tar,
-            bias_strength=10.0,
-            temp=0.5,
-            target_count=20,
+            ab=combo,
+            pay=combo,
+            tar=combo,
+            bias_strength=7.0,
+            temp=0.7,
+            target_count=linkers,
+            pool_size=100,
         )
 
+        print()
         print("------ Linker Report -------")
         print()
-        print(f"Antibody: {itos_dicts[0][ab]}")
-        print(f"Payload: {itos_dicts[1][pay]}")
-        print(f"Cancer Target: {itos_dicts[2][tar]}")
+        print(f"Antibody: {itos_dicts[0][combo]}")
+        print(f"Payload: {itos_dicts[1][combo]}")
+        print(f"Cancer Target: {itos_dicts[2][combo]}")
         print()
         for i, result in enumerate(linkers):
             print(f"------- Linker {i+1} ----------")
@@ -256,11 +256,12 @@ if __name__ == "__main__":
             real_smiles_series=real_smiles,
             tokenizer=tokenizer,
             tag_to_smiles=tag_to_smiles,
-            bias_strength=15.0,
+            bias_strength=7.0,
             temp=0.70,
             target_count=1000,
         )
 
+        print()
         print("Performance for 1000 Generated Linkers")
         print(f"validity = {results["validity"]:.4f}")
         print(f"novelty = {results["novelty"]:.4f}")
@@ -281,7 +282,7 @@ if __name__ == "__main__":
 
         while True:
             try:
-                option = input("Option: ")
+                option = int(input("Option: "))
                 if operation in valid_operation:
                     break
             except ValueError:
@@ -317,7 +318,6 @@ if __name__ == "__main__":
                 tokenizer=tokenizer,
                 itos_dicts=itos_dicts,
                 num_samples=2000,
-                color_by="antibody",
             )
 
         if option == 2:
@@ -344,8 +344,7 @@ if __name__ == "__main__":
             umap_generated_data(
                 model=gen_model,
                 tokenizer=tokenizer,
-                itos_dicts=itos_dicts,
-                bias_strength=15.0,
+                stoi_dicts=stoi_dicts,
+                bias_strength=7.0,
                 temperature=0.7,
-                color_by="antibody",  # Options: "antibody", "payload", "indication"
             )

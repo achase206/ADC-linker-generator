@@ -1,34 +1,35 @@
 import pandas as pd
-import numpy as np
 import torch
 import os
 from rdkit import Chem
+import selfies as sf
 
-from LSTM_classes import (
-    Tokenizer,
-    LSTMGenModel,
-    CriticModel,
-    adcDataset,
-)
+os.environ["RL_WARNINGS"] = "False"
+
+from LSTM_classes import Tokenizer, LSTMGenModel, CriticModel, adcDataset
 from LSTM_helpers import (
-    conditions_tokens,
     train_LSTM_gen,
     LSTM_model_RL,
+    train_classifiers,
+)
+
+from LSTM_utils import (
+    conditions_tokens,
     canonicalize_motifs,
     tag_dataset_with_motifs,
     build_tag_to_smiles_map,
-    train_classifiers,
 )
 
 if __name__ == "__main__":
 
+    print()
     print("#" * 30)
     print("ADC LINKER GENERATOR TRAINING")
     print("#" * 30)
     print()
 
     print("Name a folder to save your models")
-    print("'models', is reserved for pre-trained")
+    print("'models' is reserved for pre-trained")
     while True:
         try:
             model_directory = input("Folder name: ")
@@ -258,11 +259,12 @@ if __name__ == "__main__":
     )
 
     # Train the MLP classifiers for conditional rewards
+    print()
     train_classifiers(df=combo_df, stoi_dicts=stoi_dicts, directory=model_directory)
 
     # Train the generator models...
     print()
-    print("--- Training Generative Model ---")
+    print("Training Generative Model")
     gen_model = LSTMGenModel(
         input_dim=128,
         hidden_dim=256,
@@ -274,6 +276,7 @@ if __name__ == "__main__":
     )
 
     # Phase A: Learn Grammar (Synthetic)
+    print()
     print("Phase A: Learning Grammar (Synthetic Data)...")
     gen_model = train_LSTM_gen(
         model=gen_model,
@@ -284,6 +287,7 @@ if __name__ == "__main__":
     )
 
     # Phase B: Repair Syntax (Mixed Data)
+    print()
     print("Phase B: Repairing Syntax (Mixed Data)...")
     mixed_dataset = torch.utils.data.ConcatDataset([synth_dataset, easy_dataset])
     gen_model = train_LSTM_gen(
@@ -295,6 +299,7 @@ if __name__ == "__main__":
     )
 
     # Phase C: Polish on real data (Real Data, Low LR)
+    print()
     print("Phase C: Polish on real data...")
     gen_model = train_LSTM_gen(
         model=gen_model,
@@ -306,6 +311,7 @@ if __name__ == "__main__":
     torch.save(gen_model.state_dict(), f"{model_directory}/model_gen_weights.pth")
 
     # Phase D: Polish on perfect linker data
+    print()
     print("Phase D: Polish on perfect linker data...")
     gen_model.load_state_dict(
         torch.load(f"{model_directory}/model_gen_weights.pth", weights_only=True)
@@ -322,7 +328,8 @@ if __name__ == "__main__":
     )
 
     # Reinforcement Learning
-    print("--- Starting Reinforcement Learning ---")
+    print()
+    print("Starting Reinforcement Learning")
 
     gen_model = LSTMGenModel(
         input_dim=128,
@@ -344,21 +351,22 @@ if __name__ == "__main__":
         )
     )
 
-    # need to tune these params
     RL_trained_model = LSTM_model_RL(
         gen_model,
         critic_model,
         tokenizer,
+        stoi_dicts=stoi_dicts,
         reward_motifs=adc_motifs,
         tags_to_smiles=tag_to_smiles,
-        learning_rate=0.00005,  # .00005
-        temperature=0.70,  # 0.65
-        total_frames=2_000_000,
+        learning_rate=0.00005,
+        temperature=0.65,
+        total_frames=1_000_000,
         num_envs=32,
         frame_steps=150,
-        clip_epsilon=0.1,  # .1
-        kl=0.05,  # .0005
-        bias_strength=15.0,  # 15.0
+        clip_epsilon=0.1,
+        kl=0.05,
+        bias_strength=15.0,
+        classifier_directory=model_directory,
     )
 
     torch.save(
