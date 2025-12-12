@@ -1,7 +1,7 @@
 # 277B_Final_Project
 Final project for 277B
 
-Create environment.
+Create environment. If you have all the dependencies downloaded you can skip this. CUDA related libraries are very large...
 
 If GPU/CUDA available:
 
@@ -17,4 +17,4 @@ Activate the environment:
 
 Open launcher:
 
-`bash launcher`
+`bash launcher.sh`
