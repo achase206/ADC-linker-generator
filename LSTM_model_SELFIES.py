@@ -27,11 +27,13 @@ import pandas as pd
 import random
 import re
 import math
+import pickle
+import json
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 from rdkit import Chem
 from rdkit import rdBase
-from rdkit.Chem import AllChem, Descriptors, QED, Crippen
+from rdkit.Chem import AllChem, Descriptors, QED, DataStructs, rdFingerprintGenerator
 import sascorer
 
 import umap
@@ -39,6 +41,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
 
 import selfies as sf
 
@@ -366,6 +371,23 @@ class CriticModel(nn.Module):
         return value
 
 
+class ADCClassifier(nn.Module):
+    def __init__(self, input_dim=2048, num_classes=5):
+        super(ADCClassifier, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+
 class LogitBiasModule(nn.Module):
     def __init__(
         self,
@@ -471,6 +493,7 @@ class SmilesGeneratorEnv(EnvBase):
         device="cuda",
         seed=None,
         condition_count=5,
+        canonical_tuples=None,
     ):
         super().__init__(device=device, batch_size=[])
         # self.rewarder = reward_model
@@ -494,6 +517,26 @@ class SmilesGeneratorEnv(EnvBase):
         self.cleavable_ids = set()
         self.tail_ids = set()
         self.head_tags = []
+
+        self.classifiers = {}
+        self.label_maps = {}
+
+        self.canonical_tuples = torch.tensor(
+            canonical_tuples, device=self.device, dtype=torch.long
+        )
+
+        for name in ["antibody", "payload", "target"]:
+            # Adjust path if your folder is different
+            with open(f"classifiers/map_{name}.json", "r") as f:
+                raw_map = json.load(f)
+                self.label_maps[name] = {int(k): v for k, v in raw_map.items()}
+
+            num_classes = len(self.label_maps[name])
+            model = ADCClassifier(num_classes=num_classes).to(self.device)
+
+            model.load_state_dict(torch.load(f"classifiers/mlp_{name}.pt"))
+            model.eval()
+            self.classifiers[name] = model
 
         self.bounds = {
             "TPSA": (0, 140),
@@ -583,9 +626,11 @@ class SmilesGeneratorEnv(EnvBase):
         self.generated_sequence = []
 
         # randomize the ab, pay and target conditions on reset
-        ab_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
-        pay_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
-        tar_idx = torch.randint(1, self.condition_count, (1,), device=self.device)
+        idx = torch.randint(0, len(self.canonical_tuples), (1,), device=self.device)
+        selected_combo = self.canonical_tuples[idx]
+        ab_idx = selected_combo[:, 0]
+        pay_idx = selected_combo[:, 1]
+        tar_idx = selected_combo[:, 2]
 
         # determine whether we will prompt a head token
         use_prompt = torch.rand(1).item() < 1.0
@@ -693,7 +738,7 @@ class SmilesGeneratorEnv(EnvBase):
         reward_qed = qed
         reward_csp3 = csp3
 
-        # conver 1-10 scale to 0-1
+        # convert 1-10 scale to 0-1
         reward_sa = (10 - sa) / 9.0
         reward_sa = max(0.0, min(1.0, reward_sa))
 
@@ -755,6 +800,39 @@ class SmilesGeneratorEnv(EnvBase):
             reward += 3.0
 
         return reward
+
+    def calculate_conditional_reward(self, mol, ab_id, pay_id, tar_id):
+        if mol is None:
+            return 0.0
+
+        mfgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+        fp = mfgen.GetFingerprintAsNumPy(mol)
+
+        fp_tensor = torch.tensor(
+            np.array(fp), dtype=torch.float32, device=self.device
+        ).unsqueeze(0)
+
+        total_prob = 0.0
+        active_models = 0
+
+        targets = {"antibody": ab_id, "payload": pay_id, "target": tar_id}
+
+        with torch.no_grad():
+            for name, target_val in targets.items():
+                if name not in self.classifiers:
+                    continue
+
+                if target_val in self.label_maps[name]:
+                    network_idx = self.label_maps[name][target_val]
+
+                    logits = self.classifiers[name](fp_tensor)
+
+                    probs = torch.softmax(logits, dim=1)
+
+                    total_prob += probs[0, network_idx].item()
+                    active_models += 1
+
+        return (total_prob / active_models) if active_models > 0 else 0.0
 
     def _step(self, tensordict):
         action_token = tensordict["action"]
@@ -842,15 +920,30 @@ class SmilesGeneratorEnv(EnvBase):
                 if mol.GetNumAtoms() > 60:
                     total_reward = total_reward * 0.5
 
+                ab_id = ab_idx.item()
+                pay_id = pay_idx.item()
+                tar_id = tar_idx.item()
+
+                cond_reward = self.calculate_conditional_reward(
+                    mol, ab_id, pay_id, tar_id
+                )
+                total_reward += cond_reward * 1.5
+
             reward += total_reward
 
             if (self.episode_count % 100 == 0) and (mol != None):
                 struct_reward_info = self.calculate_structural_reward(mol)
+                chemical_reward_info = self.calculate_chemical_reward(mol, mol_depro)
+                conditional_reward_info = self.calculate_conditional_reward(
+                    mol, ab_id, pay_id, tar_id
+                )
                 print()
                 print(f"--- Ep {self.episode_count} ---")
                 print(f"SMILES: {smiles_string}")
                 print(f"Depro SMILES: {depro_smiles}")
-                print(f"Reward: {reward:.2f} (Struct Reward: {struct_reward_info})")
+                print(
+                    f"Reward: {reward:.2f} (Struct: {struct_reward_info} | Chem: {chemical_reward_info:.4f} | Cond: {conditional_reward_info:.4f})"
+                )
                 print("-----------------------------")
                 print()
 
@@ -1044,9 +1137,27 @@ def LSTM_model_RL(
         in_keys=["hidden"],
     )
 
+    valid_combos_str = [
+        ("Cetuximab", "Puromycin", "Triple negative breast cancer"),
+        ("MCLL0517A", "PBD dimer", "Acute myeloid leukaemia"),
+        ("Patritumab", "ADC-C1 payload", "Breast cancer"),
+        ("Lorvotuzumab", "Rachelmycin", "Small cell lung cancer"),
+    ]
+
+    canonical_list = []
+    for ab, pay, tar in valid_combos_str:
+        try:
+            tup = (
+                tokenizer.ab_stoi[ab],
+                tokenizer.pay_stoi[pay],
+                tokenizer.tar_stoi[tar],
+            )
+            canonical_list.append(tup)
+        except KeyError as e:
+            print(f"KeyError: {e}")
+
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.collectors.SyncDataCollector.html
     # creates our environment that handles the reset and step in RL loop
-
     environment_maker = lambda: SmilesGeneratorEnv(
         vocab_size=tokenizer.vocab_size,
         max_length=100,
@@ -1056,6 +1167,7 @@ def LSTM_model_RL(
         generator_model=gen_model,
         reward_motifs=reward_motifs,
         tags_to_smiles=tags_to_smiles,
+        canonical_tuples=canonical_list,
     )
 
     env = SerialEnv(num_envs, environment_maker)
@@ -1105,6 +1217,8 @@ def LSTM_model_RL(
     )
 
     optimizer = torch.optim.Adam(loss_module.parameters(), lr=learning_rate)
+
+    training_history = []
 
     # RL training loop
     print("Start RL training...")
@@ -1213,12 +1327,28 @@ def LSTM_model_RL(
             print(
                 f"Batch {i} || Avg Reward: {avg_final_reward:.4f} | Valid: {valid_pct:.1f}% | KL: {kl_div.item():.4f}"
             )
+
+            training_history.append(
+                {
+                    "batch": i,
+                    "avg_reward": avg_final_reward,
+                    "valid_pct": valid_pct.item(),
+                    "kl_div": kl_div.item(),
+                    "total_loss": total_loss.item(),
+                }
+            )
+
         else:
             print(
                 f"Batch {i} || Loss: {total_loss.item():.4f} | Avg Batch Reward: {avg_reward:.4f} (No episodes finished)"
             )
 
     print("RL training complete.")
+
+    if training_history:
+        df_log = pd.DataFrame(training_history)
+        df_log.to_csv("rl_training_log.csv", index=False)
+        print(f"Training log saved")
 
     return gen_model
 
@@ -1434,9 +1564,9 @@ def setup_bias(tokenizer, bias_strength=15.0):
         cleavable_ids=cleavable_ids,
         tail_ids=tail_ids,
         bias_strength=bias_strength,
-        min_steps_before_cleav=3,  # Ensure spacing
+        min_steps_before_cleav=3,
         min_steps_after_cleav=3,
-        verbose=False,  # Keep it quiet during generation
+        verbose=False,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1502,7 +1632,7 @@ def generate_biased_sequence(
             # else if no prompt scenario
             current_token = start_input
 
-    # 3. Generation Loop
+    hidden_states_list = []
     with torch.no_grad():
         for i in range(max_len):
 
@@ -1510,6 +1640,9 @@ def generate_biased_sequence(
             output, hidden, cell = gen_model(
                 current_token, ab_t, pay_t, tar_t, hidden_state=hidden, cell_state=cell
             )
+
+            current_hidden = hidden[0, -1, :]
+            hidden_states_list.append(current_hidden.cpu())
 
             # apply the bias strength modifier
             if bias_module is not None:
@@ -1553,8 +1686,16 @@ def generate_biased_sequence(
 
     # did we get all three motifs
     success = motif_status[0].all().item()
+    # last_hidden = hidden[:, -1, :].cpu().numpy()
 
-    return sequence, success
+    if len(hidden_states_list) > 0:
+        all_states = torch.stack(hidden_states_list)
+        mean_pooled = torch.mean(all_states, dim=0).numpy()
+    else:
+        # default if failed sequence
+        mean_pooled = np.zeros(hidden[0, -1, :])
+
+    return sequence, success, mean_pooled
 
 
 def selfie_sanitizer(real_smi, tag_to_smiles):
@@ -1675,7 +1816,7 @@ def generation_loop(
     while len(valid_linkers) < target_count and attempts < max_attempts:
         attempts += 1
         print(f"Attemps: {attempts}/{max_attempts}", end="\r")
-        seq, success = generate_biased_sequence(
+        seq, success, _ = generate_biased_sequence(
             gen_model=model,
             bias_module=bias_net,
             tokenizer=tokenizer,
@@ -1741,7 +1882,6 @@ def generation_loop(
                     pass
 
             else:
-                # print("Failed validity check")
                 pass
 
     if attempts >= max_attempts:
@@ -1764,17 +1904,6 @@ def performance_metrics(
 
     # start generating
     print("Generating Valid Linkers with Bias...")
-
-    fixes = {
-        "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",
-        "CCBr": "BrCC",
-        "BrCC=O": "BrCC(=O)",
-        "O=CCBr": "BrCC=O",
-        "CC#C": "C#CC",
-        "Oc1ccc(N=Nc2ccccc2)cc1": "Oc1ccc(cc1)N=Nc2ccccc2",
-        "Nc1ccc(CO)cc1": "Nc1ccc(cc1)CO",
-        "CC1c2ccccc2-c2ccccc21": "C(=O)OCC1c2ccccc2-c2ccccc21",
-    }
 
     unique_linkers = set()
     valid_smiles = 0
@@ -1810,7 +1939,7 @@ def performance_metrics(
             end="\r",
         )
 
-        seq, success = generate_biased_sequence(
+        seq, success, _ = generate_biased_sequence(
             gen_model=model,  # Use your RL trained model
             bias_module=bias_net,
             tokenizer=tokenizer,
@@ -1878,46 +2007,51 @@ def performance_metrics(
                 pass
         else:
             tagged_selfies = tokenizer.ids_to_selfies(seq)
-            tagged_smi = sf.decoder(tagged_selfies)
 
-            real_smi = selfie_sanitizer(tagged_smi, tag_to_smiles)
+            try:
+                tagged_smi = sf.decoder(tagged_selfies)
+                real_smi = selfie_sanitizer(tagged_smi, tag_to_smiles)
+            except:
+                real_smi = ":("
 
             if Chem.MolFromSmiles(real_smi) is not None:
                 # Basic deduplication
                 valid_smiles += 1
 
-    validity = valid_smiles / attempts
-    novelty = novel_linkers / valid_linkers
-    unique = len(unique_linkers) / valid_linkers
-    sa_avg = sa_total / valid_linkers
-    qed_avg = qed_total / valid_linkers
-    logp_avg = logp_total / valid_linkers
-    tpsa_avg = tpsa_total / valid_linkers
-    csp3_avg = csp3_total / valid_linkers
-    sa_std = np.std(sa_list)
-    qed_std = np.std(qed_list)
-    logp_std = np.std(logp_list)
-    tpsa_std = np.std(tpsa_list)
-    csp3_std = np.std(csp3_list)
+    mols = [Chem.MolFromSmiles(s) for s in unique_linkers]
+    mfgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
+    fps = [mfgen.GetFingerprint(m) for m in mols if m is not None]
 
-    return (
-        validity,
-        novelty,
-        unique,
-        sa_avg,
-        qed_avg,
-        logp_avg,
-        tpsa_avg,
-        csp3_avg,
-        sa_std,
-        qed_std,
-        logp_std,
-        tpsa_std,
-        csp3_std,
-    )
+    avg_tanimoto = 0.0
+    if len(fps) > 1:
+        sims = []
+        for i in range(len(fps)):
+            s = DataStructs.BulkTanimotoSimilarity(fps[i], fps[i + 1 :])
+            sims.extend(s)
+
+        avg_tanimoto = np.mean(sims) if sims else 0.0
+
+    results = {
+        "validity": valid_smiles / attempts,
+        "novelty": novel_linkers / valid_linkers,
+        "unique": len(unique_linkers) / valid_linkers,
+        "tanimoto": avg_tanimoto,
+        "sa_avg": sa_total / valid_linkers,
+        "qed_avg": qed_total / valid_linkers,
+        "logp_avg": logp_total / valid_linkers,
+        "tpsa_avg": tpsa_total / valid_linkers,
+        "csp3_avg": csp3_total / valid_linkers,
+        "sa_std": np.std(sa_list),
+        "qed_std": np.std(qed_list),
+        "logp_std": np.std(logp_list),
+        "tpsa_std": np.std(tpsa_list),
+        "csp3_std": np.std(csp3_list),
+    }
+
+    return results
 
 
-def visualize_molecule_clusters(
+def umap_training_data(
     model,
     dataset,
     tokenizer,
@@ -1925,15 +2059,11 @@ def visualize_molecule_clusters(
     num_samples=2000,
     color_by="antibody",  # Options: "antibody", "payload", "indication"
 ):
-    """
-    Runs data through the model to capture the LSTM's internal "Thought Vector"
-    (Hidden State) for each molecule, then projects it to 2D using UMAP.
-    """
-    print(f"--- GENERATING UMAP CLUSTERS (Color by: {color_by}) ---")
+
+    print(f"Producing UMAP for {color_by}")
     model.eval()
     device = next(model.parameters()).device
 
-    # Create a loader to handle padding/collating efficiently
     loader = DataLoader(
         dataset, batch_size=32, shuffle=True, collate_fn=tokenizer.collate_smiles
     )
@@ -1951,36 +2081,30 @@ def visualize_molecule_clusters(
 
     count = 0
     with torch.no_grad():
-        for i, (smile, ab, pay, tar, score) in enumerate(loader):
+        for i, (smile, ab, pay, tar) in enumerate(loader):
             if count >= num_samples:
                 break
 
-            # Move to device
             smile = smile.to(device)
             ab = ab.to(device)
             pay = pay.to(device)
             tar = tar.to(device)
 
-            # manually run the embedding step
             emb_seq = model.token_embedding(smile)
 
-            # Expand conditions to match sequence length
             seq_len = smile.size(1)
             emb_ab = model.ab_embedding(ab).expand(-1, seq_len, -1)
             emb_pay = model.pay_embedding(pay).expand(-1, seq_len, -1)
             emb_tar = model.target_embedding(tar).expand(-1, seq_len, -1)
 
-            # Concatenate
             lstm_input = torch.cat([emb_seq, emb_ab, emb_pay, emb_tar], dim=-1)
 
             out, (h, c) = model.lstm(lstm_input)
 
-            # extract the last state vector
             last_hidden = out[:, -1, :].cpu().numpy()
 
             vectors.extend(last_hidden)
 
-            # capture the labels for legend in plot
             if color_by == "antibody":
                 ids = ab.cpu().numpy().flatten()
             elif color_by == "payload":
@@ -1997,11 +2121,9 @@ def visualize_molecule_clusters(
 
     print("\nRunning UMAP dimensionality reduction... (This may take a moment)")
 
-    # 5. UMAP Projection
     reducer = umap.UMAP(n_neighbors=50, min_dist=0.1, metric="cosine", random_state=42)
     embedding = reducer.fit_transform(vectors)
 
-    # 6. Plotting
     df = pd.DataFrame(embedding, columns=["x", "y"])
     df["Condition"] = labels[: len(df)]
 
@@ -2012,7 +2134,7 @@ def visualize_molecule_clusters(
         y="y",
         hue="Condition",
         style="Condition",
-        palette="tab10",  # High contrast palette
+        palette="tab10",
         s=100,
         alpha=0.8,
     )
@@ -2021,6 +2143,224 @@ def visualize_molecule_clusters(
     plt.legend(fontsize=16.0)
     plt.tight_layout()
     plt.show()
+
+
+def umap_generated_data(
+    model,
+    tokenizer,
+    itos_dicts,
+    stoi_dicts,
+    bias_strength=15.0,
+    temperature=0.7,
+    color_by="antibody",  # Options: "antibody", "payload", "indication"
+):
+
+    print(f"Producing UMAP for ADC combos")
+
+    canonical_configs = [
+        {"ab": "Cetuximab", "pay": "Puromycin", "tar": "Triple negative breast cancer"},
+        {"ab": "MCLL0517A", "pay": "PBD dimer", "tar": "Acute myeloid leukaemia"},
+        {"ab": "Patritumab", "pay": "ADC-C1 payload", "tar": "Breast cancer"},
+        {"ab": "Lorvotuzumab", "pay": "Rachelmycin", "tar": "Small cell lung cancer"},
+    ]
+
+    ab_stoi, pay_stoi, tar_stoi = stoi_dicts
+
+    vectors = []
+    labels = []
+
+    # initialize our bias module
+    bias_net, h_ids, c_ids, t_ids = setup_bias(tokenizer, bias_strength=bias_strength)
+
+    target_count = 500  # generate 500 per condition
+    max_attempts = target_count * 1000
+
+    for config in canonical_configs:
+        valid_linkers = 0
+        attempts = 0
+
+        ab = ab_stoi[config["ab"]]
+        pay = pay_stoi[config["pay"]]
+        tar = tar_stoi[config["tar"]]
+
+        condition_label = config["ab"]
+
+        while valid_linkers < target_count and attempts < max_attempts:
+            attempts += 1
+            print(f"Attemps: {attempts}/{max_attempts}", end="\r")
+
+            _, success, last_hidden = generate_biased_sequence(
+                gen_model=model,
+                bias_module=bias_net,
+                tokenizer=tokenizer,
+                id_sets=(h_ids, c_ids, t_ids),
+                ab_idx=ab,
+                pay_idx=pay,
+                tar_idx=tar,
+                temperature=temperature,
+            )
+
+            if success:
+                valid_linkers += 1
+                vectors.append(last_hidden)
+                labels.append(condition_label)
+
+                print(
+                    f"Combo {config}: {valid_linkers}/{target_count} molecules...",
+                    end="\r",
+                )
+
+    print("\nRunning UMAP...")
+
+    reducer = umap.UMAP(n_neighbors=50, min_dist=0.1, metric="cosine", random_state=42)
+    embedding = reducer.fit_transform(vectors)
+
+    df = pd.DataFrame(embedding, columns=["x", "y"])
+    df["Condition"] = labels[: len(df)]
+
+    plt.figure(figsize=(8, 8))
+    sns.scatterplot(
+        data=df,
+        x="x",
+        y="y",
+        hue="Condition",
+        style="Condition",
+        palette="tab10",
+        s=100,
+        alpha=0.8,
+    )
+
+    plt.title(f"Molecule Latent Space conditioned by {color_by.title()}", fontsize=18)
+    plt.legend(fontsize=16.0)
+    plt.tight_layout()
+    plt.show()
+
+
+def compute_fingerprint(smiles, n_bits=2048):
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        return np.zeros(2048, dtype=np.float32)
+
+    mfgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=n_bits)
+    fp = mfgen.GetFingerprintAsNumPy(mol)
+    # need float 32 for pytorch compatibility
+    return np.array(fp, dtype=np.float32)
+
+
+def train_classifiers(
+    df,
+    stoi_dicts,
+    smiles_col="smiles",
+    ab_col="antibody_name",
+    pay_col="payload_name",
+    tar_col="indication",
+    device="cuda" if torch.cuda.is_available() else "cpu",
+):
+    print(f"Training on device: {device}")
+
+    # prepare valid data that has conditions
+    valid_data = df[
+        df[smiles_col].apply(lambda x: Chem.MolFromSmiles(x) is not None)
+    ].copy()
+
+    # create our data matrix, samples by fingerprint bits (N_samples, 2048)
+    X_raw = np.stack(valid_data[smiles_col].apply(compute_fingerprint).values)
+
+    ab_stoi, pay_stoi, tar_stoi = stoi_dicts
+
+    # Convert strings to initial integer IDs
+    y_ab_full = valid_data[ab_col].map(ab_stoi).dropna().astype(int).values
+    y_pay_full = valid_data[pay_col].map(pay_stoi).dropna().astype(int).values
+    y_tar_full = valid_data[tar_col].map(tar_stoi).dropna().astype(int).values
+
+    tasks = [
+        ("antibody", y_ab_full, valid_data[ab_col].map(ab_stoi).notna()),
+        ("payload", y_pay_full, valid_data[pay_col].map(pay_stoi).notna()),
+        ("target", y_tar_full, valid_data[tar_col].map(tar_stoi).notna()),
+    ]
+
+    trained_models = {}
+
+    for name, y_target, mask in tasks:
+        print(f"Training {name} Model")
+
+        # Filter X to match rows
+        X_curr = X_raw[mask]
+
+        # 2. FILTER UNKNOWNS (Class 0)
+        # We only want to train on real classes
+        real_mask = y_target != 0
+        X_curr = X_curr[real_mask]
+        y_target = y_target[real_mask]
+
+        if len(y_target) < 50:
+            print(f"Skipping {name}: Not enough data.")
+            continue
+
+        # 3. CRITICAL: Create Label Mapping (Real ID -> Network Index)
+        # PyTorch needs labels 0, 1, 2... but your IDs might be 1, 5, 8.
+        unique_classes = sorted(np.unique(y_target))
+        label_map = {int(real_id): idx for idx, real_id in enumerate(unique_classes)}
+
+        # Transform y_target to 0..N-1
+        y_mapped = np.array([label_map[y] for y in y_target])
+        num_classes = len(unique_classes)
+
+        print(f"Classes: {num_classes} | Samples: {len(y_target)}")
+        print(f"ID Mapping: {label_map}")
+
+        # Split Data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X_curr, y_mapped, test_size=0.2, random_state=42
+        )
+
+        # Convert to Tensors
+        X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+        y_train_t = torch.tensor(y_train, dtype=torch.long).to(device)
+        X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
+        y_test_t = torch.tensor(y_test, dtype=torch.long).to(device)
+
+        # 4. Initialize Model & Optimizer
+        model = ADCClassifier(num_classes=num_classes).to(device)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+        epochs = 50  # Small dataset, converges fast
+        batch_size = 32
+
+        model.train()
+        for epoch in range(epochs):
+            permutation = torch.randperm(X_train_t.size()[0])
+
+            epoch_loss = 0.0
+            for i in range(0, X_train_t.size()[0], batch_size):
+                indices = permutation[i : i + batch_size]
+                batch_x, batch_y = X_train_t[indices], y_train_t[indices]
+
+                optimizer.zero_grad()
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+        model.eval()
+        with torch.no_grad():
+            logits = model(X_test_t)
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == y_test_t).float().mean().item()
+            print(f"--> Accuracy: {acc:.4f}")
+
+        # save the model
+        torch.save(model.state_dict(), f"classifiers/mlp_{name}.pt")
+
+        # save mapping so network knows which conditions correspond to what in environment class
+        with open(f"classifiers/map_{name}.json", "w") as f:
+            json.dump(label_map, f)
+
+        trained_models[name] = model
+
+    return trained_models
 
 
 if __name__ == "__main__":
@@ -2240,6 +2580,9 @@ if __name__ == "__main__":
         source_type="real",
     )
 
+    # Train the random forest classifiers for conditional rewards
+    # train_classifiers(df=combo_df, stoi_dicts=stoi_dicts)
+
     # # Train the generator models...
     # print()
     # print("--- Training Generative Model ---")
@@ -2312,36 +2655,36 @@ if __name__ == "__main__":
         condition_count=5,
     )
 
-    # # Re-init models to ensure clean slate loading
-    # critic_model = CriticModel(hidden_dim=256, output_dim=1)
+    # Re-init models to ensure clean slate loading
+    critic_model = CriticModel(hidden_dim=256, output_dim=1)
 
-    # # Load Generator (Final Weights)
-    # gen_model.load_state_dict(
-    #     torch.load("models/model_gen_weights_perfect.pth", weights_only=True)
-    # )
+    # Load Generator (Final Weights)
+    gen_model.load_state_dict(
+        torch.load("models/model_gen_weights_perfect.pth", weights_only=True)
+    )
 
-    # # need to tune these params
-    # RL_trained_model = LSTM_model_RL(
-    #     gen_model,
-    #     critic_model,
-    #     tokenizer,
-    #     reward_motifs=adc_motifs,
-    #     tags_to_smiles=tag_to_smiles,
-    #     learning_rate=0.00005,  # .00005
-    #     temperature=0.65,  # 1.0
-    #     total_frames=1_000_000,
-    #     num_envs=32,
-    #     frame_steps=150,
-    #     clip_epsilon=0.1,  # .1
-    #     kl=0.0005,  # .05
-    #     bias_strength=15.0,  # 15.0
-    # )
+    # need to tune these params
+    RL_trained_model = LSTM_model_RL(
+        gen_model,
+        critic_model,
+        tokenizer,
+        reward_motifs=adc_motifs,
+        tags_to_smiles=tag_to_smiles,
+        learning_rate=0.00005,  # .00005
+        temperature=0.65,  # 0.65
+        total_frames=1_000_000,
+        num_envs=32,
+        frame_steps=150,
+        clip_epsilon=0.1,  # .1
+        kl=0.005,  # .2
+        bias_strength=15.0,  # 15.0
+    )
 
-    # torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights.pth")
+    torch.save(RL_trained_model.state_dict(), "models/model_RL_gen_weights_v2.pth")
 
-    # gen_model.load_state_dict(
-    #     torch.load("models/model_RL_gen_weights.pth", weights_only=True)
-    # )
+    gen_model.load_state_dict(
+        torch.load("models/model_RL_gen_weights_v2.pth", weights_only=True)
+    )
 
     # gen_model.load_state_dict(
     #     torch.load("models/model_gen_weights_perfect.pth", weights_only=True)
@@ -2385,58 +2728,58 @@ if __name__ == "__main__":
     #     df=combo_df,  # or perfect_df
     #     tokenizer=tokenizer,
     #     stoi_dicts=stoi_dicts,
-    #     augment=False,
     #     source_type="real",
     # )
 
-    # visualize_molecule_clusters(
+    # umap_training_data(
     #     model=gen_model,
     #     dataset=viz_dataset,
     #     tokenizer=tokenizer,
     #     itos_dicts=itos_dicts,
     #     num_samples=2000,
-    #     color_by="indication",
+    #     color_by="antibody",
     # )
 
     # gen_model.load_state_dict(
     #     torch.load("models/model_RL_gen_weights.pth", weights_only=True)
     # )
 
-    gen_model.load_state_dict(
-        torch.load("models/model_gen_weights_perfect.pth", weights_only=True)
-    )
+    # gen_model.load_state_dict(
+    #     torch.load("models/model_gen_weights_perfect.pth", weights_only=True)
+    # )
 
-    real_smiles = adc_df["smiles"]
+    # real_smiles = adc_df["smiles"]
 
-    (
-        validity,
-        novelty,
-        unique,
-        sa_avg,
-        qed_avg,
-        logp_avg,
-        tpsa_avg,
-        csp3_avg,
-        sa_std,
-        qed_std,
-        logp_std,
-        tpsa_std,
-        csp3_std,
-    ) = performance_metrics(
-        model=gen_model,
-        real_smiles_series=real_smiles,
-        tokenizer=tokenizer,
-        tag_to_smiles=tag_to_smiles,
-        bias_strength=15.0,
-        temp=0.70,
-        target_count=1000,
-    )
+    # results = performance_metrics(
+    #     model=gen_model,
+    #     real_smiles_series=real_smiles,
+    #     tokenizer=tokenizer,
+    #     tag_to_smiles=tag_to_smiles,
+    #     bias_strength=15.0,
+    #     temp=0.80,
+    #     target_count=1000,
+    # )
 
-    print(f"validity = {validity}")
-    print(f"novelty = {novelty}")
-    print(f"unique = {unique}")
-    print(f"SA Avg = {sa_avg} | std = {sa_std}")
-    print(f"QED AVG = {qed_avg} | std = {qed_std}")
-    print(f"LogP AVG = {logp_avg} | std = {logp_std}")
-    print(f"TPSA AVG = {tpsa_avg} | std = {tpsa_std}")
-    print(f"CSP3 AVG = {csp3_avg} | std = {csp3_std}")
+    # print(f"validity = {results["validity"]:.4f}")
+    # print(f"novelty = {results["novelty"]:.4f}")
+    # print(f"unique = {results["unique"]:.4f}")
+    # print(f"tanimoto = {results["tanimoto"]:.4f}")
+    # print(f"SA Avg = {results["sa_avg"]:.4f} \tstd = {results["sa_std"]:.4f}")
+    # print(f"QED AVG = {results["qed_avg"]:.4f} \tstd = {results["qed_std"]:.4f}")
+    # print(f"LogP AVG = {results["logp_avg"]:.4f} \tstd = {results["logp_std"]:.4f}")
+    # print(f"TPSA AVG = {results["tpsa_avg"]:.4f} \tstd = {results["tpsa_std"]:.4f}")
+    # print(f"CSP3 AVG = {results["csp3_avg"]:.4f} \tstd = {results["csp3_std"]:.4f}")
+
+    # gen_model.load_state_dict(
+    #     torch.load("models/model_RL_gen_weights.pth", weights_only=True)
+    # )
+
+    # umap_generated_data(
+    #     model=gen_model,
+    #     tokenizer=tokenizer,
+    #     itos_dicts=itos_dicts,
+    #     stoi_dicts=stoi_dicts,
+    #     bias_strength=15.0,
+    #     temperature=0.7,
+    #     color_by="payload",  # Options: "antibody", "payload", "indication"
+    # )
