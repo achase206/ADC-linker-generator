@@ -1,0 +1,22 @@
+name: lstm_model
+channels:
+  - conda-forge
+  - pytorch
+dependencies:
+  - python=3.12
+  - numpy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - rdkit
+  - selfies
+  - umap-learn
+  - pytorch
+  - torchvision
+  - cpuonly  # Remove this line if you have a GPU/CUDA setup
+  - pip
+  
+  - pip:
+    - torchrl
+    - tensordict
