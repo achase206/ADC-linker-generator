@@ -43,6 +43,7 @@ if __name__ == "__main__":
     """LSTM Setup"""
     print("LSTM setup starting...")
 
+    # List of different adc motifs for tokenization
     adc_motifs = {
         "cleavable": [
             "Nc1ccc(cc1)CO",  # PABC Core
@@ -83,9 +84,10 @@ if __name__ == "__main__":
             "C(=O)OCc1ccccc1",  # Cbz
         ],
     }
+
+    # load ADC data
     adc_directory = "data/adc_data_filtered.pkl"
     synthetic_directory = "data/synthetic_data.pkl"
-
     adc_df = pd.read_pickle(adc_directory)
     synth_df = pd.read_pickle(synthetic_directory)
     adc_df["data_type"] = "real"
@@ -108,7 +110,7 @@ if __name__ == "__main__":
     adc_motifs_clean = canonicalize_motifs(adc_motifs)
 
     # Apply Graph Tags
-    # This replace complex motifs with our dummy atoms
+    # This replaces complex motifs with our dummy atoms
     combo_df, tag_map = tag_dataset_with_motifs(combo_df, adc_motifs_clean)
 
     # create our tag to smiles map
@@ -164,6 +166,7 @@ if __name__ == "__main__":
     combo_df = pd.concat([boring_sample, interesting_df], ignore_index=True)
 
     # some of the motifs have trouble getting reattached and need to be flipped
+    # see selfies_sanitizer for more detailed approach for SELFIES
     fixes = {
         "CCN=[N+]=[N-]": "[N-]=[N+]=NCC",
         "CCBr": "BrCC",
@@ -184,6 +187,7 @@ if __name__ == "__main__":
 
     print(f"smiles fixes applied: {patches_applied}")
 
+    # get our different reward patterns to help identify perfect linkers df
     reward_patterns = {
         "heads": [
             Chem.MolFromSmiles(s) for s in adc_motifs["heads"] if Chem.MolFromSmiles(s)
@@ -198,6 +202,7 @@ if __name__ == "__main__":
         ],
     }
 
+    # perfect linkers have all three motif categories from our mapping
     def perfect_linkers(smi):
         # same as our calculate struct reward inside env class
         if not smi:
@@ -243,7 +248,6 @@ if __name__ == "__main__":
         source_type="synthetic",
     )
 
-    # previously tried having smiles augmentation but it confused model
     easy_dataset = adcDataset(
         df=combo_df,
         tokenizer=tokenizer,

@@ -33,6 +33,7 @@ if __name__ == "__main__":
     """LSTM Setup"""
     print("LSTM setup starting...")
 
+    # ADC motifs dictionary
     adc_motifs = {
         "cleavable": [
             "Nc1ccc(cc1)CO",  # PABC Core
@@ -73,9 +74,12 @@ if __name__ == "__main__":
             "C(=O)OCc1ccccc1",  # Cbz
         ],
     }
+
+    # Kept all the file generation stuff even for the run loop
+    # The tokenizer needs the dataset to define the vocab list for tokens
+    # In the future should change to some sort of static vocab to speed load times
     adc_directory = "data/adc_data_filtered.pkl"
     synthetic_directory = "data/synthetic_data.pkl"
-
     adc_df = pd.read_pickle(adc_directory)
     synth_df = pd.read_pickle(synthetic_directory)
     adc_df["data_type"] = "real"
@@ -129,6 +133,7 @@ if __name__ == "__main__":
     tokenizer = Tokenizer(combo_df, tag_map=tag_map)
     stoi_dicts, itos_dicts, dict_lengths = conditions_tokens(combo_df)
 
+    # self explanatory, ask user for inputs and proceed to run various functions
     print("LSTM setup complete")
     print()
     print("Use ctrl-C to exit at any time")

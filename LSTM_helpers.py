@@ -62,12 +62,15 @@ def train_LSTM_gen(
     learning_rate=0.001,
     num_epochs=1000,
 ):
+    """
+    Training loop for the LSTM model
+    """
     batch_size = 64
     loader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=tokenizer.collate_smiles,
+        collate_fn=tokenizer.collate_smiles,  # applies the padding to sequences
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -138,6 +141,25 @@ def LSTM_model_RL(
     bias_strength=5.0,
     classifier_directory=None,
 ):
+    """
+    Handles the RL training loop.
+
+    :param gen_model: pre-RL generative model
+    :param critic_model: critic model
+    :param tokenizer: tokenizer object
+    :param reward_motifs: adc motif dict
+    :param tags_to_smiles: converts tokens to smiles
+    :param stoi_dicts: converts conditional strings to ints
+    :param learning_rate: standard learning rate
+    :param temperature: logit temp for predictions
+    :param total_frames: total tokens generated during training
+    :param num_envs: parallel sequences generated per episode
+    :param frame_steps: max sequence length
+    :param clip_epsilon: advantage clip for PPO
+    :param kl: kl divergence, lower is more allowed divergence
+    :param bias_strength: logit bias strength
+    :param classifier_directory: where the classifier model is saved
+    """
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.modules.tensordict_module.ProbabilisticActor.html
     # creating a dict for our LSTM generative model that the actor can then understand for RL
     # similar tensor dicts are used for passing around data for RL
@@ -204,6 +226,7 @@ def LSTM_model_RL(
         in_keys=["hidden"],
     )
 
+    # creates canonical string combos passed into env
     valid_combos_str = [
         ("Cetuximab", "Puromycin", "Triple negative breast cancer"),
         ("MCLL0517A", "PBD dimer", "Acute myeloid leukaemia"),
@@ -347,9 +370,6 @@ def LSTM_model_RL(
                     cell_state=inp_cell,
                 )
 
-            ###### BUG ################
-            # indentation error here need to fix, KL not being applied
-            # next get the actor logits to compare against
             actor_logits, _, _ = gen_model(
                 sequence=inp_obs,
                 antibody=inp_ab,
@@ -422,6 +442,10 @@ def LSTM_model_RL(
 
 
 def setup_bias(tokenizer, bias_strength=15.0):
+    """
+    Helper to initialize the bias module for use in generation functions
+    Used in all of the post training generation to apply bias strength to logits
+    """
     head_ids = set()
     cleavable_ids = set()
     tail_ids = set()
@@ -466,6 +490,11 @@ def generate_biased_sequence(
     max_len=100,
     use_prompt=True,
 ):
+    """
+    Generates a linker sequence with bias applied
+    ADC conditions can be individually applied
+    max_len is max linker length
+    """
 
     # this is basically the same loop for applying bias as in our RL loop
     device = next(gen_model.parameters()).device
@@ -565,7 +594,6 @@ def generate_biased_sequence(
 
     # did we get all three motifs
     success = motif_status[0].all().item()
-    # last_hidden = hidden[:, -1, :].cpu().numpy()
 
     if len(hidden_states_list) > 0:
         all_states = torch.stack(hidden_states_list)
@@ -589,7 +617,10 @@ def generation_loop(
     target_count=10,
     pool_size=100,
 ):
-
+    """
+    Calls biased sequence generator on a loop
+    Targets a certain number of linkers to report out of pool size
+    """
     # initialize our bias module
     bias_net, h_ids, c_ids, t_ids = setup_bias(tokenizer, bias_strength=bias_strength)
 
@@ -621,6 +652,7 @@ def generation_loop(
                 tagged_selfies = tokenizer.ids_to_selfies(seq)
                 tagged_smi = sf.decoder(tagged_selfies)
 
+                # apply selfies fix for motif directionality
                 real_smi = selfie_sanitizer(tagged_smi, tag_to_smiles)
 
                 mol = Chem.MolFromSmiles(real_smi)
@@ -635,6 +667,8 @@ def generation_loop(
                             # filter away boring small stuff
                             if mol.GetNumHeavyAtoms() < 25:
                                 continue
+
+                            # get the linker chemical properties
                             mol = Chem.MolFromSmiles(real_smi)
                             tpsa = Descriptors.TPSA(mol)
                             logp = Descriptors.MolLogP(mol)
@@ -666,7 +700,7 @@ def generation_loop(
                 pass
 
     if attempts >= max_attempts:
-        print("Warning: Hit max attempts limit.")
+        print("Hit max attempts limit")
 
     sorted_linkers = sorted(valid_linkers, key=lambda x: x["Score"], reverse=True)
 
@@ -684,6 +718,9 @@ def performance_metrics(
     temp=0.8,
     target_count=10,
 ):
+    """
+    Generates average chemical property/uniqueness and novelty data for many linkers
+    """
 
     # initialize our bias module
     bias_net, h_ids, c_ids, t_ids = setup_bias(tokenizer, bias_strength=bias_strength)
@@ -691,6 +728,7 @@ def performance_metrics(
     # start generating
     print("Generating Valid Linkers with Bias...")
 
+    # results trackers
     unique_linkers = set()
     valid_smiles = 0
     novel_linkers = 0
@@ -736,6 +774,7 @@ def performance_metrics(
             temperature=temp,  # Lower temp slightly for stability
         )
 
+        # gen bias sequences returns success on good linker
         if success:
             tagged_selfies = tokenizer.ids_to_selfies(seq)
 
@@ -758,6 +797,7 @@ def performance_metrics(
                     novel_linkers += 1
 
                 try:
+                    # applies deprotection for calculating certain properties
                     depro_smiles = real_smi
                     for protected, deprotected in tokenizer.depro_map.items():
                         if protected in real_smi:
@@ -789,7 +829,6 @@ def performance_metrics(
                     pass
 
             else:
-                # print("Failed validity check")
                 pass
         else:
             tagged_selfies = tokenizer.ids_to_selfies(seq)
@@ -804,6 +843,7 @@ def performance_metrics(
                 # Basic deduplication
                 valid_smiles += 1
 
+    # generate fingerprints for tanimoto similarity score
     mols = [Chem.MolFromSmiles(s) for s in unique_linkers]
     mfgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
     fps = [mfgen.GetFingerprint(m) for m in mols if m is not None]
@@ -845,7 +885,9 @@ def umap_training_data(
     num_samples=2000,
     color_by="antibody",  # Options: "antibody", "payload", "indication"
 ):
-
+    """
+    Generate UMAP for model on training data
+    """
     print(f"Producing UMAP for {color_by}")
     model.eval()
     device = next(model.parameters()).device
@@ -854,6 +896,7 @@ def umap_training_data(
         dataset, batch_size=32, shuffle=True, collate_fn=tokenizer.collate_smiles
     )
 
+    # store the vectors and labels for projection
     vectors = []
     labels = []
 
@@ -887,6 +930,7 @@ def umap_training_data(
 
             out, (h, c) = model.lstm(lstm_input)
 
+            # important, get the last hidden layer to project
             last_hidden = out[:, -1, :].cpu().numpy()
 
             vectors.extend(last_hidden)
@@ -940,9 +984,12 @@ def umap_generated_data(
     bias_strength=15.0,
     temperature=0.7,
 ):
-
+    """
+    Generates a UMAP on generated linkers
+    """
     print(f"Producing UMAP for ADC combos")
 
+    # all possible valid combos for conditions
     canonical_configs = [
         {"ab": "Cetuximab", "pay": "Puromycin", "tar": "Triple negative breast cancer"},
         {"ab": "MCLL0517A", "pay": "PBD dimer", "tar": "Acute myeloid leukaemia"},
@@ -950,6 +997,7 @@ def umap_generated_data(
         {"ab": "Lorvotuzumab", "pay": "Rachelmycin", "tar": "Small cell lung cancer"},
     ]
 
+    # unpack the stoi dicts for easier use
     ab_stoi, pay_stoi, tar_stoi = stoi_dicts
 
     vectors = []
@@ -961,6 +1009,7 @@ def umap_generated_data(
     target_count = 500  # generate 500 per condition
     max_attempts = target_count * 1000
 
+    # for each combo generate a set number of linkers to project
     for config in canonical_configs:
         valid_linkers = 0
         attempts = 0
@@ -1029,6 +1078,12 @@ def train_classifiers(
     tar_col="indication",
     device="cuda" if torch.cuda.is_available() else "cpu",
 ):
+    """
+    Trains the simple classifier model.
+
+    Used for assessing how well generated linkers fit to a desired ab, pay, tar combo class
+    Allows conditional adherance based rewards for RL
+    """
     print(f"Training on device: {device}")
 
     # prepare valid data that has conditions
@@ -1057,11 +1112,10 @@ def train_classifiers(
     for name, y_target, mask in tasks:
         print(f"Training {name} Model")
 
-        # Filter X to match rows
+        # filter X to match rows
         X_curr = X_raw[mask]
 
-        # 2. FILTER UNKNOWNS (Class 0)
-        # We only want to train on real classes
+        # should just be real data but filter just in case
         real_mask = y_target != 0
         X_curr = X_curr[real_mask]
         y_target = y_target[real_mask]
@@ -1070,35 +1124,33 @@ def train_classifiers(
             print(f"Skipping {name}: Not enough data.")
             continue
 
-        # 3. CRITICAL: Create Label Mapping (Real ID -> Network Index)
-        # PyTorch needs labels 0, 1, 2... but your IDs might be 1, 5, 8.
+        # create the label mapping for conditions
         unique_classes = sorted(np.unique(y_target))
         label_map = {int(real_id): idx for idx, real_id in enumerate(unique_classes)}
 
-        # Transform y_target to 0..N-1
         y_mapped = np.array([label_map[y] for y in y_target])
         num_classes = len(unique_classes)
 
         print(f"Classes: {num_classes} | Samples: {len(y_target)}")
         print(f"ID Mapping: {label_map}")
 
-        # Split Data
+        # split data up
         X_train, X_test, y_train, y_test = train_test_split(
             X_curr, y_mapped, test_size=0.2, random_state=42
         )
 
-        # Convert to Tensors
+        # convert the test split to tensors for torch training
         X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
         y_train_t = torch.tensor(y_train, dtype=torch.long).to(device)
         X_test_t = torch.tensor(X_test, dtype=torch.float32).to(device)
         y_test_t = torch.tensor(y_test, dtype=torch.long).to(device)
 
-        # 4. Initialize Model & Optimizer
+        # init the model and training conditions
         model = ADCClassifier(num_classes=num_classes).to(device)
         criterion = nn.CrossEntropyLoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        epochs = 50  # Small dataset, converges fast
+        epochs = 50
         batch_size = 32
 
         model.train()

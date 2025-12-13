@@ -22,11 +22,9 @@ from rdkit import Chem
 from rdkit import rdBase
 from rdkit.Chem import Descriptors, QED, rdFingerprintGenerator
 import sascorer
-
 import pandas as pd
 import numpy as np
 import os
-
 import selfies as sf
 
 # Disable error messages when a non-valid smiles is encountered
@@ -38,6 +36,14 @@ from LSTM_utils import selfie_sanitizer
 
 
 class Tokenizer:
+    """
+    Tokenizer class handles token creation and conversion operations.
+
+    Initially produces vocabulary of tokens.
+    These include the individual SELFIES tokens from dataset
+    as well as custom tokens for padding, start, end, etc.
+    """
+
     def __init__(self, df=None, tag_map=None):
 
         # store the motifs
@@ -64,25 +70,23 @@ class Tokenizer:
         if df is not None and "selfies" in df.columns:
             self.build_vocab(df["selfies"].tolist())
 
+        # not really related to tokenization but needed this later on and tokenizer already available
+        # removes bulky tail groups to get better calculation for certain rewards
         self.depro_map = {
-            # Fmoc (Carbamate): Includes the Nitrogen in your string
-            # Replace the whole group with just "N" (Primary Amine)
+            # Fmoc (Carbamate)
             "NC(=O)OCC1c2ccccc2-c2ccccc21": "N",
-            # Boc (Carbamate): Attached to an N
-            # Replace with nothing (leaves the N it was attached to)
+            # Boc (Carbamate)
             "C(=O)OC(C)(C)C": "",
-            # Cbz (Carbamate): Attached to an N
-            # Replace with nothing (leaves the N it was attached to)
+            # Cbz (Carbamate)
             "C(=O)OCc1ccccc1": "",
-            # Thioacetate (Thiol protection): Includes the Sulfur in your string
-            # Replace "S-Acetyl" with just "S" (Free Thiol)
+            # Thioacetate (Thiol protection)
             "CC(=O)S": "S",
             # Levulinyl (Alcohol/Amine protection)
-            # Replace with nothing (leaves the O/N it was attached to)
             "CC(=O)CCC(=O)": "",
         }
 
     def build_vocab(self, selfies_list):
+        """Generates token vocab during LSTM run/train initialization"""
         for s in selfies_list:
             try:
                 # split selfies by brackets into tokens
@@ -112,21 +116,13 @@ class Tokenizer:
         self.vocab_size = len(self.vocab_list)
 
     def selfies_to_ids(self, selfies_string):
+        """Helper for converting SELFIES to token ids"""
         try:
             tokens = list(sf.split_selfies(selfies_string))
             ids = []
             for t in tokens:
                 # Get ID
                 token_id = self.smiles_map.get(t, self.unk_token)
-
-                # --- DEBUG BLOCK ---
-                if not isinstance(token_id, int):
-                    print(f"CRITICAL ERROR: Token '{t}' mapped to Non-Int '{token_id}'")
-                    print(f"Type: {type(token_id)}")
-                    # Force it to unk_token (0) to prevent crash so we can see logs
-                    token_id = self.unk_token
-                # -------------------
-
                 ids.append(token_id)
 
             ids.append(self.end_token)
@@ -136,6 +132,7 @@ class Tokenizer:
             return [self.unk_token]
 
     def ids_to_selfies(self, token_ids):
+        """Helper for converting token ids to SELFIES"""
         tokens = []
         for tid in token_ids:
             # handles case where token is tensor scalar
@@ -158,7 +155,11 @@ class Tokenizer:
         return "".join(tokens)
 
     def collate_smiles(self, batch):
-        """Kept the old name from using SMILES, now collates our selfies tokens"""
+        """
+        Kept the old name from using SMILES, now collates our selfies tokens
+        Basically this adds padding tokens to keep batch length consistent
+        This is required for training and generation when using the data loader or env loader for RL
+        """
         smiles_list, ab_list, pay_list, target_list = zip(*batch)
 
         smiles_padded = pad_sequence(
@@ -173,6 +174,12 @@ class Tokenizer:
 
 
 class adcDataset(Dataset):
+    """
+    Dataset class for using our ADC data with pytorch
+
+    Performs a couple of optimizations like pre-tokenizing the training data.
+    Returns smiles and ab, payload and target ids as tensors
+    """
 
     def __init__(
         self,
@@ -224,6 +231,13 @@ class adcDataset(Dataset):
 
 
 class LSTMGenModel(nn.Module):
+    """
+    LSTM Generative Model
+
+    Initializes embedding for conditions and tokens
+    Used nn.LSTM instead of defining entire architecture from scratch
+    """
+
     def __init__(
         self,
         input_dim,
@@ -311,8 +325,10 @@ class LSTMGenModel(nn.Module):
         # each iteration needs to see the conditions that it is optimizing around
         # ie the first token needs to know antibody, payload, target as does each subsequent token
         # https://docs.pytorch.org/docs/stable/generated/torch.Tensor.expand.html
+
         # -1 keeps dimensions the same, just repeats for as long as the sequence length so we have
         # enough vecs to concatenate to sequence vecs
+
         embedded_ab = embedded_ab.expand(-1, seq_len, -1)
         embedded_pay = embedded_pay.expand(-1, seq_len, -1)
         embedded_target = embedded_target.expand(-1, seq_len, -1)
@@ -325,18 +341,22 @@ class LSTMGenModel(nn.Module):
         out, (hidden_state, cell_state) = self.lstm(lstm_input)
         out = self.fc(out)  # final layer
 
-        # out[:, :, 0] = -1e9  # mask pad token
-
-        # start_idx = out.size(-1) - 1
-        # out[:, :, start_idx] = -1e9  # mask the start token
-
-        hidden_state = hidden_state.permute(1, 0, 2)  # swap them back for tensordict
+        # swap them back for tensordict
+        # very weird quirk of using torchRL, probably made for transformers instead??
+        hidden_state = hidden_state.permute(1, 0, 2)
         cell_state = cell_state.permute(1, 0, 2)
 
         return out, hidden_state, cell_state
 
 
 class CriticModel(nn.Module):
+    """
+    Critic Model for RL
+
+    Simple multi-layer perceptron
+    takes current hidden state from LSTM during generation
+    """
+
     def __init__(self, hidden_dim, output_dim):
         super().__init__()
 
@@ -358,6 +378,13 @@ class CriticModel(nn.Module):
 
 
 class ADCClassifier(nn.Module):
+    """
+    Simple ANN for judging conditional adherence
+
+    Trained on real ADC data with payload, antibody and cancer info
+    Used to predict how close generated sequences are to the right class
+    """
+
     def __init__(self, input_dim=2048, num_classes=5):
         super(ADCClassifier, self).__init__()
         self.network = nn.Sequential(
@@ -385,36 +412,36 @@ class LogitBiasModule(nn.Module):
         verbose=False,
     ):
         super().__init__()
+        # https://docs.pytorch.org/docs/stable/generated/torch.nn.Module.html
+        # Basically needed to get the motif id data from the module
         # Ensure we have long tensors for indexing
         self.register_buffer(
             "cleavable_idx", torch.tensor(list(cleavable_ids), dtype=torch.long)
         )
         self.register_buffer("tail_idx", torch.tensor(list(tail_ids), dtype=torch.long))
         self.bias = bias_strength
-        self.verbose = verbose
+        self.verbose = (
+            verbose  # had some serious issues with this, enables debug printing
+        )
         self.min_steps_before_cleav = min_steps_before_cleav
         self.min_steps_after_cleav = min_steps_after_cleav
 
     def forward(self, logits, motif_status, step_count):
-        # logits shape: (Batch, 1, Vocab)
-        # motif_status shape: (Batch, 3) [Head, Cleav, Tail]
-
-        # 1. Create a zero-filled bias mask of shape (Batch, Vocab)
-        # We match the device and dtype of the input logits
+        # match the device and dtype of the input logits
         bias_mask = torch.zeros(
             logits.size(0), logits.size(2), device=logits.device, dtype=logits.dtype
         )
 
-        # 2. Determine boolean conditions
+        # these are our masks
         has_head = motif_status[:, 0]
         has_cleav = motif_status[:, 1]
         has_tail = motif_status[:, 2]
 
-        # Logic: If Head exists but No Cleavable -> Boost Cleavable
+        # if head but no cleavable apply strength to cleavable
         wait_for_cleav = step_count.squeeze() > self.min_steps_before_cleav
         boost_cleav = has_head & (~has_cleav) & wait_for_cleav
 
-        # Logic: If Cleavable exists but No Tail -> Boost Tail
+        # if cleavable but no tail apply strength to tail
         min_tail_step = self.min_steps_before_cleav + self.min_steps_after_cleav
         wait_for_tail = step_count.squeeze() > min_tail_step
         boost_tail = has_cleav & (~has_tail) & wait_for_tail
@@ -422,40 +449,43 @@ class LogitBiasModule(nn.Module):
         if self.verbose and boost_cleav.any():
             rows = torch.where(boost_cleav)[0]
 
-            # 1. Get the max logit (the token the model WANTS to pick)
-            # logits is (Batch, 1, Vocab), squeeze to (Batch, Vocab)
+            # gets logit info for debugging
             current_logits = logits[rows, 0, :]
             max_val, max_idx = torch.max(current_logits, dim=-1)
 
-            # 2. Get the logit of the token we represent (just picking the first cleavable_id to test)
             target_idx = self.cleavable_idx[0]
             target_val = current_logits[:, target_idx]
 
-        # 3. Apply Bias to Mask
-        # "rows" gives us the batch indices that need boosting
+        # apply the bias to the mask
         if boost_cleav.any():
             rows = torch.where(boost_cleav)[0]
-            # Advanced Indexing: [Rows, Column_Indices] = Bias
-            # We use broadcasting to apply bias to all cleavable_ids for the selected rows
+
+            # broadcast to apply bias to all cleavable_ids for the selected rows
             bias_mask[rows[:, None], self.cleavable_idx] = self.bias
 
             if self.verbose:
-                print(f"DEBUG: Boosting Cleavables for {len(rows)} sequences")
+                print(f"Boosting Cleavables for {len(rows)} sequences")
 
         if boost_tail.any():
             rows = torch.where(boost_tail)[0]
             bias_mask[rows[:, None], self.tail_idx] = self.bias
 
             if self.verbose:
-                print(f"DEBUG: Boosting Tails for {len(rows)} sequences")
+                print(f"Boosting Tails for {len(rows)} sequences")
 
-        # 4. Add Mask to Original Logits
-        # logits is (Batch, 1, Vocab), bias_mask is (Batch, Vocab)
-        # We unsqueeze mask to (Batch, 1, Vocab) to match dimensions
+        # apply the boost from masking
+        # unsqueeze to match dimensions
         return logits + bias_mask.unsqueeze(1)
 
 
 class SmilesGeneratorEnv(EnvBase):
+    """
+    SmilesGeneratorEnv handles the RL environments
+    Manages reset at beginning of training episode
+    Handles reward calculations
+    Handles each step and done condition
+    """
+
     # https://docs.pytorch.org/rl/main/reference/generated/torchrl.envs.EnvBase.html
     # https://docs.pytorch.org/rl/0.8/reference/generated/torchrl.data.CompositeSpec.html
     # https://docs.pytorch.org/tutorials/advanced/pendulum.html
@@ -467,7 +497,6 @@ class SmilesGeneratorEnv(EnvBase):
 
     def __init__(
         self,
-        # reward_model,
         vocab_size,
         max_length,
         num_layers,
@@ -483,7 +512,6 @@ class SmilesGeneratorEnv(EnvBase):
         classifier_directory=None,
     ):
         super().__init__(device=device, batch_size=[])
-        # self.rewarder = reward_model
         self.vocab_size = vocab_size
         self.max_length = max_length
         self.num_layers = num_layers
@@ -510,12 +538,13 @@ class SmilesGeneratorEnv(EnvBase):
 
         self.classifier_directory = classifier_directory
 
+        # canon tuples are our ab, pay, tar combos from real data
         self.canonical_tuples = torch.tensor(
             canonical_tuples, device=self.device, dtype=torch.long
         )
 
+        # get the dicts from jsons from the classifier model setup
         for name in ["antibody", "payload", "target"]:
-            # Adjust path if your folder is different
             with open(f"{self.classifier_directory}/map_{name}.json", "r") as f:
                 raw_map = json.load(f)
                 self.label_maps[name] = {int(k): v for k, v in raw_map.items()}
@@ -529,6 +558,7 @@ class SmilesGeneratorEnv(EnvBase):
             model.eval()
             self.classifiers[name] = model
 
+        # impose bounds for scores just in case something weird happens
         self.bounds = {
             "TPSA": (0, 140),
             "LogP": (-2, 5),
@@ -542,7 +572,7 @@ class SmilesGeneratorEnv(EnvBase):
                 if tag in tokenizer.smiles_map:
                     idx = tokenizer.smiles_map[tag]
 
-                    # Populate the sets based on the category name
+                    # populate the sets based on the category name
                     if "HEAD" in name:
                         self.head_ids.add(idx)
                         self.head_tags.append(tag)
@@ -550,10 +580,6 @@ class SmilesGeneratorEnv(EnvBase):
                         self.cleavable_ids.add(idx)
                     elif "TAIL" in name:
                         self.tail_ids.add(idx)
-
-        # Verify we actually found them
-        if len(self.head_ids) == 0:
-            print("WARNING: No Head IDs found in Environment! Bias will fail.")
 
         # compile the reward patterns from our rewards motif dict
         # this is what we will use to produce structural rewards for good linkers
@@ -613,6 +639,7 @@ class SmilesGeneratorEnv(EnvBase):
         return seed + 1
 
     def _reset(self, tensordict=None):
+        """Manages reset of the environment state for new sequence generated"""
         self.current_step = 0
         self.generated_sequence = []
 
@@ -641,6 +668,7 @@ class SmilesGeneratorEnv(EnvBase):
             h = h.squeeze(0)
             c = c.squeeze(0)
 
+        # pick a random head to start with
         if use_prompt and len(self.head_tags) > 0:
             prompt_tag = random.choice(self.head_tags)
             prompt_id = self.token.smiles_map[prompt_tag]
@@ -654,6 +682,7 @@ class SmilesGeneratorEnv(EnvBase):
             cell_state = c
         else:
             # Standard start without the prompt injection
+            # defaulted to 100% prompting for simplicity
             start_token = torch.tensor(
                 [self.token.start_token], device=self.device, dtype=torch.long
             )
@@ -676,6 +705,7 @@ class SmilesGeneratorEnv(EnvBase):
             dtype=torch.bool,
         )
 
+        # return the reset environment state
         return TensorDict(
             {
                 "observation": start_token,
@@ -695,6 +725,12 @@ class SmilesGeneratorEnv(EnvBase):
         )
 
     def calculate_chemical_reward(self, mol, mol_depro):
+        """
+        Calculates our chemical property rewards
+
+        :param mol: our standard mol with bulky tails
+        :param mol_depro: mol with deprotected tails
+        """
         if mol is None:
             return 0.0
 
@@ -723,9 +759,9 @@ class SmilesGeneratorEnv(EnvBase):
         reward_tpsa = max(0.0, reward_tpsa)
 
         # targeting specific range
+        # should have probably set lower bound higher, got really low logp for some sequences
         reward_logp = 1.0 if (0 <= logp <= 5) else 0.5
 
-        # already 0 to 1, higher is better
         reward_qed = qed
         reward_csp3 = csp3
 
@@ -744,14 +780,16 @@ class SmilesGeneratorEnv(EnvBase):
         # check for excessive peroxides and apply penalty
         peroxide_matches = len(mol.GetSubstructMatches(Chem.MolFromSmarts("[#8]-[#8]")))
         if peroxide_matches > 0:
-            # Exponential penalty: -2.0 for 1 match, -8.0 for 2 matches
-            # This ensures O-O-O (2 matches) is punished much harder than O-O
+            # exponential penalty here to really punish many ox in a row
             penalty = (peroxide_matches**2) * 2.0
             total -= penalty
 
         return total
 
     def calculate_structural_reward(self, mol):
+        """
+        Calculates our rewards for having the necessary motifs
+        """
         reward = 0.0
 
         has_head = False
@@ -773,7 +811,7 @@ class SmilesGeneratorEnv(EnvBase):
                 has_tail = True
                 break
 
-        # Do you have at least one of these?
+        # did we get at least one
         if has_head:
             reward += 1.0
         if has_cleavable:
@@ -781,7 +819,7 @@ class SmilesGeneratorEnv(EnvBase):
         if has_tail:
             reward += 1.0
 
-        # Did we get a combination?
+        # did we get a combo or all?
         if has_head and has_cleavable:
             reward += 2.0
         if has_tail and has_cleavable:
@@ -793,9 +831,14 @@ class SmilesGeneratorEnv(EnvBase):
         return reward
 
     def calculate_conditional_reward(self, mol, ab_id, pay_id, tar_id):
+        """
+        Calculates reward for matching desired ab, pay, tar conditions
+        Uses our multilayer perceptron classifier model
+        """
         if mol is None:
             return 0.0
 
+        # model was trained on the morgan fingerprints of sequences
         mfgen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
         fp = mfgen.GetFingerprintAsNumPy(mol)
 
@@ -826,6 +869,10 @@ class SmilesGeneratorEnv(EnvBase):
         return (total_prob / active_models) if active_models > 0 else 0.0
 
     def _step(self, tensordict):
+        """
+        step handles each token generated
+        provides end logic with reward calls
+        """
         action_token = tensordict["action"]
         self.generated_sequence.append(action_token.item())
         self.current_step += 1
@@ -851,6 +898,7 @@ class SmilesGeneratorEnv(EnvBase):
         is_tail = token_id in self.tail_ids
         is_end = token_id == self.token.end_token
         is_max = self.current_step >= self.max_length
+        # all possible done conditions
         done = is_end | is_max | force_terminate | is_tail
 
         ab_idx = tensordict["antibody"]
@@ -870,7 +918,6 @@ class SmilesGeneratorEnv(EnvBase):
             [new_head, new_cleav, new_tail], device=self.device, dtype=torch.bool
         )
 
-        # reward = -(repetition_penalty + step_penalty)
         reward = -repetition_penalty + step_penalty
 
         if done:
@@ -899,7 +946,7 @@ class SmilesGeneratorEnv(EnvBase):
             if mol is None:
                 total_reward = -0.5
             else:
-                # baseline reward for valid smiles is +1.0
+                # baseline reward for valid smiles
                 total_reward = 1.0
                 struct_bonus = self.calculate_structural_reward(mol)
                 total_reward += struct_bonus * 0.5  # reward for adc motifs

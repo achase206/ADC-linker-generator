@@ -3,19 +3,15 @@ import re
 from rdkit import Chem
 from rdkit import rdBase
 from rdkit.Chem import AllChem, rdFingerprintGenerator
-import sascorer
-
-import umap
-import matplotlib.pyplot as plt
-import numpy as np
-
-import selfies as sf
 
 # Disable error messages when a non-valid smiles is encountered
 rdBase.DisableLog("rdApp.error")
 
 
 def conditions_tokens(df):
+    """
+    Used to apply the conditional tokens to selfies tokens during training
+    """
 
     def conditions_mapping(condition: str, dict_length: int):
         top_unique = list(df[condition].value_counts().head(dict_length).index)
@@ -37,6 +33,9 @@ def conditions_tokens(df):
 
 
 def canonicalize_motifs(motif_dict):
+    """
+    Canonicalizes adc motifs for consistent mapping
+    """
     clean_dict = {}
     for key, smiles_list in motif_dict.items():
         clean_list = []
@@ -51,6 +50,9 @@ def canonicalize_motifs(motif_dict):
 
 
 def tag_dataset_with_motifs(df, motif_dict):
+    """
+    replaces found motifs in dataset with corresponding motif ids
+    """
     print("Tagging dataset with ADC motif replacements")
 
     replacements = []
@@ -122,6 +124,9 @@ def tag_dataset_with_motifs(df, motif_dict):
 
 
 def build_tag_to_smiles_map(motif_dict):
+    """
+    helper for generating map to smiles for motifs
+    """
     tag_to_smiles = {}
     counter = 1
 
@@ -137,6 +142,10 @@ def build_tag_to_smiles_map(motif_dict):
 def selfie_sanitizer(real_smi, tag_to_smiles):
     """
     Applies structural fixes, regex cleanup, and tag replacement to a raw SMILES string.
+
+    Basically just attempted convert selfies to smiles and iterated until I found all the issues
+    Used LLM assistance to generate all these conversion for each structure
+    This took forever....
     """
     # Structural Fixes Dictionary
     fixes = {
@@ -194,7 +203,6 @@ def selfie_sanitizer(real_smi, tag_to_smiles):
     # Amide fix
     real_smi = real_smi.replace("C(N)=O", "C(=O)N")
 
-    # 5. Strip Explicit Tags
     real_smi = re.sub(r"\[CH\d?\]", "C", real_smi)
     real_smi = re.sub(r"\[OH\d?\]", "O", real_smi)
     real_smi = re.sub(r"\[NH\d?\]", "N", real_smi)
@@ -208,11 +216,8 @@ def selfie_sanitizer(real_smi, tag_to_smiles):
     real_smi = real_smi.replace("n1cnnc1C", "c1nnc(C)nn1")
     real_smi = real_smi.replace("C1=NN=C(C)N=N1", "c1nnc(C)nn1")
 
-    # 6. Cleanup Trailing Garbage
     real_smi = re.sub(r"(=O)+$", "", real_smi)
 
-    # 7. Aromaticity Fallback Check
-    # (If RDKit fails, try converting aromatic lower case to aliphatic upper case)
     if Chem.MolFromSmiles(real_smi) is None:
         if any(char in real_smi for char in ["c", "n", "o", "s"]):
             fallback = (
@@ -228,6 +233,11 @@ def selfie_sanitizer(real_smi, tag_to_smiles):
 
 
 def compute_fingerprint(smiles, n_bits=2048):
+    """
+    computes the morgan fingerprints for smiles string
+
+    used for classifier model and for calculating tanimoto similarity
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         return np.zeros(2048, dtype=np.float32)
