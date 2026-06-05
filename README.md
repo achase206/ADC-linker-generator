@@ -1,3 +1,15 @@
+__This repository is a personal mirror of a group final project originally developed for Machine Learning Algorithms (Chem 277B) at UC Berkeley. My primary contributions included:__
+
+* Background research into current approaches for linker generation.
+* Identifying training data sets.
+* Generating synthetic training data via a combinatorial approach.
+* Developing forced-teacher training for initial learning.
+* Developing reinforcement learning pipeline and optimizing rewards.
+* Produced UMAP visualizations to show impact of cancer indication, antibody and payload on linker generation.
+* Wrote majority of final report.
+
+### The full report can be found here: [View Final Report](Final_Project_Report.pdf)
+
 # Optimizing ADC Linkers via LSTM Reinforcement Learning
 
 Alex Chase achase95@berkeley.edu <br>
